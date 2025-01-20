@@ -1,0 +1,31 @@
+/**
+ * OmniExporter — Configuration
+ *
+ * SETUP:
+ * 1. Copy this file to 'config.js' (which is gitignored)
+ * 2. Fill in the values below
+ * 3. Reload the extension in chrome://extensions/
+ *
+ * IMPORTANT: After configuring this file, you MUST also:
+ * 1. Deploy cloudflare-worker/worker.js to your own Cloudflare account
+ * 2. Add your extension ID to ALLOWED_ORIGINS in the worker
+ * 3. Set OAUTH_SERVER_URL below to your deployed worker URL
+ * See cloudflare-worker/DEPLOY.md for full deployment instructions
+ *
+ * SECURITY:
+ * - config.js is listed in .gitignore — it will NOT be committed
+ * - The Notion Client Secret is stored on the Cloudflare Worker, NOT here
+ * - Only the Client ID (public) is needed in this file
+ */
+
+// ─── Notion OAuth ────────────────────────────────────────────────
+// Get your Client ID from: https://www.notion.so/my-integrations
+// The Client Secret goes in your Cloudflare Worker environment variables (see cloudflare-worker/DEPLOY.md)
+const NOTION_CLIENT_ID = 'YOUR_CLIENT_ID_HERE';
+
+// ─── OAuth Server ────────────────────────────────────────────────
+// REQUIRED: Your deployed Cloudflare Worker URL (see cloudflare-worker/DEPLOY.md for deployment guide)
+// If not set, the extension falls back to the project's shared default worker.
+// For production use, deploy your own worker and set this value.
+// Default: https://omniexporter-oauth.YOUR_SUBDOMAIN.workers.dev
+const OAUTH_SERVER_URL = 'https://omniexporter-oauth.YOUR_SUBDOMAIN.workers.dev';
