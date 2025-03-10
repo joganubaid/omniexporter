@@ -1,0 +1,849 @@
+// OmniExporter
+// content.js - Unified Platform Adapter
+"use strict";
+
+// ── RE-INJECTION GUARD ────────────────────────────────────────────────────────
+// On extension reload, Chrome re-injects scripts into active tabs.
+// We need to re-register listeners but avoid "const already declared" errors.
+//
+// Guard checks ONLY __omniExporterLoaded.  The previous dual-check
+// (__omniExporterLoaded && __omniExporterManager) had a subtle bug: if the
+// script crashed after setting __omniExporterLoaded = true but before reaching
+// "window.__omniExporterManager = manager" at the bottom, the guard always
+// evaluated false and the broken script re-ran on every subsequent injection,
+// crashing again and again in an infinite loop.
+
+// If already loaded, re-register the message listener (if manager is ready)
+if (window.__omniExporterLoaded) {
+    if (window.__omniExporterManager) {
+        window.__omniExporterManager.initialize();
+        console.log('[OmniExporter] Re-registered message listener after reload');
+    } else {
+        // Manager never initialised (previous run crashed) — skip re-execution to
+        // avoid looping.  A page reload is required to fully recover.
+        console.warn('[OmniExporter] Previous initialisation crashed; skipping re-injection. Reload the page to recover.');
+    }
+    // Don't execute the rest of the file
+} else {
+    // Mark as loaded immediately so any mid-script crash doesn't cause an infinite
+    // re-injection loop (the guard above will catch __omniExporterLoaded = true and bail out).
+    window.__omniExporterLoaded = true;
+
+    // Initialize Logger for content script
+    if (typeof Logger !== 'undefined') {
+        Logger.init().then(() => {
+            Logger.info('Content', 'Content script active', { url: window.location.hostname });
+        }).catch(() => { });
+    }
+
+    console.log("OmniExporter Content Script Active");
+
+    // ============================================
+    // SECURITY UTILITIES (window property to prevent re-declaration)
+    // ============================================
+    if (!window.SecurityUtils) {
+        window.SecurityUtils = {
+            // Validate UUID format before using in any API call.
+            // Allow alphanumeric, underscore, hyphen, 8-128 chars.
+            // All adapters call this on extracted UUIDs to block injection
+            // (e.g. someone navigating to /chat/<malicious-string>).
+            isValidUuid: (uuid) => {
+                if (!uuid || typeof uuid !== 'string') return false;
+                return /^[a-zA-Z0-9_-]{8,128}$/.test(uuid);
+            }
+        };
+    }
+
+    // Reference SecurityUtils
+    const SecurityUtils = window.SecurityUtils;
+
+    // ============================================
+    // CONTENT SCRIPT MANAGER
+    // ============================================
+    if (!window.ContentScriptManager) {
+        window.ContentScriptManager = class ContentScriptManager {
+            constructor() {
+                this.messageHandler = null;
+                this.cleanupFunctions = [];
+            }
+
+            initialize() {
+                // Remove existing listener if any (safety against multiple injections)
+                this.cleanup();
+
+                this.messageHandler = (request, sender, sendResponse) => {
+                    this.handleMessage(request, sendResponse);
+                    return true; // Keep message channel open for async response
+                };
+
+                if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
+                    chrome.runtime.onMessage.addListener(this.messageHandler);
+                } else {
+                    console.warn('[OmniExporter] chrome.runtime unavailable, message listener not registered');
+                }
+
+                // Cleanup on visibility change (optional optimization)
+                const visibilityHandler = () => {
+                    if (document.hidden) {
+                        // We could pause things here if needed
+                    }
+                };
+                document.addEventListener('visibilitychange', visibilityHandler);
+                this.cleanupFunctions.push(() => {
+                    document.removeEventListener('visibilitychange', visibilityHandler);
+                });
+
+                // SPA Navigation Handler — tracks the current conversation UUID
+                // in a window-local sentinel so the next EXTRACT_CONTENT call
+                // sees the new UUID instead of the stale one captured at script
+                // load time. The background SW doesn't need to know about
+                // navigation events — message dispatch + alarm wakeups cover
+                // the real cases — so we no longer send a SPA_NAVIGATION
+                // message (there was no handler for it on the SW side).
+                const navigationHandler = () => {
+                    const adapter = getPlatformAdapter();
+                    if (!adapter) return;
+                    const newUuid = adapter.extractUuid(window.location.href);
+                    if (newUuid && newUuid !== window.__omniCurrentUuid) {
+                        console.debug('[OmniExporter] SPA navigation, new conversation:', newUuid);
+                        window.__omniCurrentUuid = newUuid;
+                    }
+                };
+
+                // Handle browser back/forward
+                window.addEventListener('popstate', navigationHandler);
+                this.cleanupFunctions.push(() => {
+                    window.removeEventListener('popstate', navigationHandler);
+                });
+
+                // Store the truly-original functions behind a window sentinel.
+                // Without this, re-injection captures the already-patched version, stacking indefinitely.
+                if (!history.__omniOriginalPushState) {
+                    history.__omniOriginalPushState = history.pushState;
+                    history.__omniOriginalReplaceState = history.replaceState;
+                }
+                const originalPushState = history.__omniOriginalPushState;
+                const originalReplaceState = history.__omniOriginalReplaceState;
+
+                history.pushState = function (...args) {
+                    originalPushState.apply(this, args);
+                    navigationHandler();
+                };
+
+                history.replaceState = function (...args) {
+                    originalReplaceState.apply(this, args);
+                    navigationHandler();
+                };
+
+                this.cleanupFunctions.push(() => {
+                    history.pushState = history.__omniOriginalPushState;
+                    history.replaceState = history.__omniOriginalReplaceState;
+                });
+
+                console.log("OmniExporter Content Script Initialized");
+            }
+
+            cleanup() {
+                if (this.messageHandler && typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
+                    try { chrome.runtime.onMessage.removeListener(this.messageHandler); } catch (e) {}
+                    this.messageHandler = null;
+                }
+                this.cleanupFunctions.forEach(fn => fn());
+                this.cleanupFunctions = [];
+                console.log("OmniExporter Content Script Cleaned Up");
+            }
+
+            async handleMessage(request, sendResponse) {
+                // Health check handler
+                if (request.type === 'HEALTH_CHECK') {
+                    sendResponse({ healthy: true, timestamp: Date.now() });
+                    return;
+                }
+
+                const adapter = getPlatformAdapter();
+                if (!adapter) {
+                    sendResponse({ success: false, error: "Unsupported platform." });
+                    return;
+                }
+
+                try {
+                    if (request.type === "EXTRACT_CONTENT") {
+                        await handleExtraction(adapter, sendResponse);
+                    } else if (request.type === "EXTRACT_CONTENT_BY_UUID") {
+                        if (!request.payload?.uuid) {
+                            sendResponse({ success: false, error: 'Missing UUID in payload' });
+                            return;
+                        }
+                        await handleExtractionByUuid(adapter, request.payload.uuid, sendResponse);
+                    } else if (request.type === "GET_THREAD_LIST") {
+                        await handleGetThreadList(adapter, request.payload || {}, sendResponse);
+                    } else if (request.type === "GET_THREAD_LIST_OFFSET") {
+                        await handleGetThreadListOffset(adapter, request.payload || {}, sendResponse);
+                    } else if (request.type === "GET_SPACES") {
+                        await handleGetSpaces(adapter, sendResponse);
+                    } else if (request.type === "GET_PLATFORM_INFO") {
+                        sendResponse({ success: true, platform: adapter.name });
+                    } else if (request.type === "EXPORT_THREAD") {
+                        // Context menu export handler — calls ExportManager directly.
+                        // Background sends this message after extracting thread content.
+                        try {
+                            const { data, format = 'markdown' } = request.payload;
+                            if (typeof ExportManager !== 'undefined') {
+                                ExportManager.export(data, format, data.platform);
+                                sendResponse({ success: true });
+                            } else {
+                                sendResponse({ success: false, error: 'ExportManager not loaded' });
+                            }
+                        } catch (exportErr) {
+                            sendResponse({ success: false, error: exportErr.message });
+                        }
+                        return; // sendResponse already called
+                    } else {
+                        // Unknown message type — respond immediately so the caller doesn't hang.
+                        sendResponse({ success: false, error: `Unknown message type: ${request.type}` });
+                    }
+                } catch (error) {
+                    sendResponse({ success: false, error: error.message });
+                }
+            }
+        };
+    }
+
+    // Create manager instance
+    const manager = new window.ContentScriptManager();
+    manager.initialize();
+    window.__omniExporterManager = manager;
+
+    // Ensure cleanup on page unload
+    window.addEventListener('beforeunload', () => manager.cleanup());
+
+
+/**
+ * Normalize entries from any adapter format to expected blocks format
+ * This ensures all platforms return data in the format popup.js expects
+ * 
+ * Adapters return various formats:
+ * - ChatGPT: { entries: [{query_str, blocks}], title }
+ * - Perplexity: Similar blocks format
+ * - Gemini/Grok/DeepSeek: { detail: { entries: [{query, answer}] } }
+ * - Or sometimes: { entries: [{query, answer}] }
+ */
+function normalizeEntries(detail, platform) {
+    // Handle various possible data structures
+    let entries = [];
+
+    // Priority 1: Check if detail has entries directly (ChatGPT, Perplexity return this)
+    if (detail?.entries && Array.isArray(detail.entries)) {
+        entries = detail.entries;
+    }
+    // Priority 2: Check nested detail.detail.entries (Gemini/Grok/DeepSeek)
+    else if (detail?.detail?.entries && Array.isArray(detail.detail.entries)) {
+        entries = detail.detail.entries;
+    }
+    // Priority 3: If detail itself is an array
+    else if (Array.isArray(detail)) {
+        entries = detail;
+    }
+    // Priority 4: For adapters returning messages directly
+    else if (detail?.messages && Array.isArray(detail.messages)) {
+        entries = detail.messages;
+    }
+
+    // Use Array.isArray() before .length to guard against non-array truthy values.
+    if (!Array.isArray(entries) || entries.length === 0) {
+        return [];
+    }
+
+    return entries.map((entry, index) => {
+        // If already in expected format with valid blocks, return as-is
+        if (entry.blocks && Array.isArray(entry.blocks) && entry.blocks.length > 0) {
+            // Verify the blocks have content
+            const hasContent = entry.blocks.some(b =>
+                b?.markdown_block?.answer || b?.markdown_block?.chunks
+            );
+            if (hasContent) {
+                return entry;
+            }
+        }
+
+        // Extract query - try multiple possible keys
+        const query = entry.query_str || entry.query || entry.question || entry.prompt || '';
+
+        // Extract answer - try multiple possible keys
+        let answer = '';
+
+        // Check blocks first (might have empty blocks)
+        if (entry.blocks && Array.isArray(entry.blocks)) {
+            entry.blocks.forEach(block => {
+                if (block?.markdown_block?.answer) {
+                    answer += block.markdown_block.answer + '\n\n';
+                } else if (block?.markdown_block?.chunks) {
+                    const chunks = block.markdown_block.chunks;
+                    answer += (Array.isArray(chunks) ? chunks.join('\n') : String(chunks)) + '\n\n';
+                }
+            });
+        }
+
+        // Fallback to flat answer fields
+        if (!answer.trim()) {
+            answer = entry.answer || entry.response || entry.text || entry.content || '';
+        }
+
+
+        // Convert to expected format
+        return {
+            query_str: query,
+            query: query, // Keep for backward compatibility
+            blocks: [{
+                intended_usage: 'ask_text',
+                markdown_block: {
+                    answer: answer.trim()
+                }
+            }],
+            // Preserve original fields
+            created_datetime: entry.created_datetime || entry.create_time || new Date().toISOString(),
+            updated_datetime: entry.updated_datetime || entry.update_time
+        };
+    });
+}
+
+/**
+ * Handle Single Extraction (Current Chat)
+ */
+async function handleExtraction(adapter, sendResponse) {
+    try {
+        const uuid = adapter.extractUuid(window.location.href);
+        if (!uuid) throw new Error(`Open a ${adapter.name} chat first.`);
+        // Security: Validate UUID format before using in API calls
+        if (!SecurityUtils.isValidUuid(uuid)) {
+            throw new Error(`Invalid conversation ID format.`);
+        }
+
+        const detail = await adapter.getThreadDetail(uuid);
+
+        // Normalize entries to expected format
+        const normalizedEntries = normalizeEntries(detail, adapter.name);
+
+        // Get title from various sources
+        const title = detail?.title || document.title?.replace(` - ${adapter.name}`, '').trim() || 'Untitled';
+
+        sendResponse({
+            success: true,
+            data: {
+                title: title,
+                uuid: uuid,
+                detail: { entries: normalizedEntries },
+                platform: adapter.name,
+                debug: detail?.debug
+            }
+        });
+    } catch (error) {
+        if (typeof Logger !== 'undefined') Logger.error('Content', 'Extraction error', { error: error.message });
+        console.error(`[OmniExporter] Extraction error:`, error);
+        sendResponse({ success: false, error: error.message });
+    }
+}
+
+/**
+ * Handle Specific Thread Extraction
+ */
+async function handleExtractionByUuid(adapter, uuid, sendResponse) {
+    try {
+        // Security: Validate UUID format before using in API calls
+        if (!uuid || !SecurityUtils.isValidUuid(uuid)) {
+            sendResponse({ success: false, error: 'Invalid conversation ID format.' });
+            return;
+        }
+        const detail = await adapter.getThreadDetail(uuid);
+
+        // Normalize entries to expected format
+        const normalizedEntries = normalizeEntries(detail, adapter.name);
+        const title = detail?.title || `Thread_${uuid}`;
+
+        sendResponse({
+            success: true,
+            data: {
+                title: title,
+                uuid: uuid,
+                detail: { entries: normalizedEntries },
+                platform: adapter.name,
+                debug: detail?.debug
+            }
+        });
+    } catch (error) {
+        if (typeof Logger !== 'undefined') Logger.error('Content', 'ExtractionByUuid error', { error: error.message, uuid });
+        console.error(`[OmniExporter] ExtractionByUuid error:`, error);
+        sendResponse({ success: false, error: error.message });
+    }
+}
+
+/**
+ * Handle Thread List Fetching
+ */
+async function handleGetThreadList(adapter, payload, sendResponse) {
+    try {
+        const response = await adapter.getThreads(payload.page || 1, payload.limit || 20, payload.spaceId);
+        sendResponse({ success: true, data: response });
+    } catch (error) {
+        sendResponse({ success: false, error: error.message });
+    }
+}
+
+/**
+ * Handle Thread List Fetching with Direct Offset (for Load All feature)
+ * Supports all 6 platforms with anti-bot measures.
+ *
+ * TODO(v6): The `if (adapter.name === 'X')` chain below special-cases each
+ * platform because their list APIs differ (POST body vs query params, cursor
+ * vs offset, fixed pageSize cap, etc.). Two refactors would simplify this:
+ *
+ *   1. Standardise `adapter.getThreads(page, limit, options = {})` across all
+ *      6 adapters so the orchestrator doesn't need to know the third arg's
+ *      meaning. See README "Architecture Roadmap".
+ *   2. Move the platform-specific request-building (Perplexity POST body,
+ *      ChatGPT bearer-token headers, Claude V2 URL, Grok pageSize=60) into
+ *      each adapter's own `getThreadsWithOffset(offset, limit)` method. The
+ *      orchestrator would just call `adapter.getThreadsWithOffset(offset, limit)`
+ *      uniformly and return whatever shape comes back.
+ *
+ * Neither refactor changes user behaviour — they just remove the per-platform
+ * switch statement and make adding a 7th platform a single-file change.
+ */
+async function handleGetThreadListOffset(adapter, payload, sendResponse) {
+    try {
+        const offset = payload.offset || 0;
+        const limit = payload.limit || 50;
+
+        // ANTI-BOT: Add random delay between ALL requests including the first.
+        // First request (offset===0) used to fire immediately with no delay.
+        // Perplexity and Claude have bot detection that can trigger on unnaturally fast first requests.
+        const delay = offset === 0
+            ? 100 + Math.random() * 300   // 100–400ms on first request
+            : 200 + Math.random() * 600;  // 200–800ms on subsequent pages
+        await new Promise(r => setTimeout(r, delay));
+
+        // Common headers to appear more like a real browser
+        const browserHeaders = {
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin'
+        };
+
+        // PERPLEXITY: One API call per message, 20 items at a time.
+        //
+        // Why NOT getAllThreads/getThreadsWithOffset:
+        //   getAllThreads fetches every page sequentially inside one Chrome message
+        //   (500 threads = 25 API calls x ~300ms = ~7-15s). Chrome message channel
+        //   times out, the whole thing dies, 0 threads returned.
+        //
+        // Correct approach: each GET_THREAD_LIST_OFFSET message = ONE API call = 20 items.
+        //   options.js loop: offset += rawThreads.length (advances by 20 each time),
+        //   keepLoading = hasMore (from has_next_page, the only reliable signal).
+        //   For 500 threads: 25 round-trips x ~300ms each = ~7.5s total, no timeouts.
+        if (adapter.name === 'Perplexity') {
+            if (typeof platformConfig === 'undefined') throw new Error('platformConfig not loaded');
+
+            const endpoint = platformConfig.buildEndpoint('Perplexity', 'listThreads');
+            const baseUrl  = platformConfig.getBaseUrl('Perplexity');
+            const version  = (platformConfig.activeVersions?.get('Perplexity')) || '2.18';
+            const spaceId  = payload.spaceId || null;
+
+            // Always send limit=20 — the API ignores larger values anyway.
+            // HAR-verified (2026-05) body shape — exclude_asi:false and
+            // include_assets:true are required to (a) not silently filter out
+            // ASI-mode threads, and (b) include asset references in list items.
+            const body = {
+                limit: 20,
+                offset,
+                ascending: false,
+                search_term: "",
+                exclude_asi: false,
+                include_assets: true
+            };
+            if (spaceId) body.collection_uuid = spaceId;
+
+            const pResp = await fetch(`${baseUrl}${endpoint}`, {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                    ...browserHeaders,
+                    'content-type': 'application/json',
+                    'x-app-apiclient': 'default',
+                    'x-app-apiversion': version
+                },
+                body: JSON.stringify(body)
+            });
+
+            if (!pResp.ok) throw new Error(`Perplexity API ${pResp.status}`);
+
+            const pData  = await pResp.json();
+            const pItems = Array.isArray(pData) ? pData : [];
+
+            const pThreads = pItems.map(t => ({
+                uuid:                t.slug || t.uuid,
+                title:               t.title || DataExtractor.extractTitle(t, 'Perplexity') || 'Untitled',
+                last_query_datetime: t.last_query_datetime,
+                display_model:       t.display_model || '',
+                mode:                t.mode || ''
+            }));
+
+            // has_next_page is the ONLY reliable "more pages" signal.
+            // total_threads lies — reports ~99 even for 500+ thread accounts.
+            const pHasMore = pItems.length > 0 ? (pItems[0].has_next_page === true) : false;
+
+            console.log(`[Perplexity] offset=${offset} got=${pThreads.length} hasMore=${pHasMore}`);
+            sendResponse({ success: true, data: { threads: pThreads, offset, hasMore: pHasMore } });
+        }
+        // DeepSeek with cursor-based offset simulation
+        else if (adapter.name === 'DeepSeek' && adapter.getThreadsWithOffset) {
+            const result = await adapter.getThreadsWithOffset(offset, limit);
+            sendResponse({
+                success: true,
+                data: {
+                    threads: result.threads,
+                    offset: result.offset,
+                    hasMore: result.hasMore,
+                    total: result.total
+                }
+            });
+        }
+        // ChatGPT with native offset support + anti-bot headers
+        else if (adapter.name === 'ChatGPT') {
+            try {
+                if (typeof platformConfig === 'undefined') {
+                    throw new Error('platformConfig not loaded');
+                }
+                if (typeof ChatGPTAdapter === 'undefined') {
+                    throw new Error('ChatGPTAdapter not loaded');
+                }
+                const baseUrl = platformConfig.getBaseUrl('ChatGPT');
+                const endpoint = platformConfig.buildEndpoint('ChatGPT', 'conversations');
+                // HAR parameters: offset=0&limit=28&order=updated&is_archived=false&is_starred=false
+                // Server seems to strict-check limit=28 or similar, 50 causes 500 error
+                const safeLimit = 28;
+                const url = `${baseUrl}${endpoint}?offset=${offset}&limit=${safeLimit}&order=updated&is_archived=false&is_starred=false`;
+
+                // Use the full HAR-verified headers including Bearer token
+                const chatgptHeaders = await ChatGPTAdapter._getHeaders();
+                const response = await fetch(url, {
+                    credentials: 'include',
+                    headers: {
+                        ...browserHeaders,
+                        ...chatgptHeaders
+                    }
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    const threads = (data.items || []).map(t => ({
+                        uuid: t.id,
+                        title: t.title || 'ChatGPT Chat',
+                        last_query_datetime: t.update_time
+                    }));
+                    const total = data.total || 0;
+                    const hasMore = total > 0
+                        ? (offset + threads.length < total)
+                        : (threads.length === safeLimit);
+                    sendResponse({
+                        success: true,
+                        data: { threads, offset, hasMore, total }
+                    });
+                } else if (response.status === 403 || response.status === 429) {
+                    // Bot detection or rate limit. Don't fall back to DOM scraping —
+                    // the sidebar is virtualized and would silently return only the
+                    // first ~20 visible threads, hiding the rest of the user's history.
+                    const reason = response.status === 429
+                        ? 'rate-limited'
+                        : 'blocked by bot detection';
+                    sendResponse({
+                        success: false,
+                        error: `ChatGPT API ${reason} (HTTP ${response.status}). Refresh the ChatGPT tab and try again.`
+                    });
+                } else {
+                    sendResponse({
+                        success: false,
+                        error: `ChatGPT API returned HTTP ${response.status}. Refresh the ChatGPT tab and try again.`
+                    });
+                }
+            } catch (e) {
+                console.error('[ChatGPT] Error:', e.message);
+                sendResponse({ success: false, error: e.message });
+            }
+        }
+        // GEMINI: One batchexecute API call per message.
+        //
+        // Problem with getThreadsWithOffset: it calls getAllThreads() which loops 100+ pages
+        // inside a single Chrome message → timeout, 0 results.
+        //
+        // Fix: call getThreads(page, limit, cursor) directly — ONE request per message.
+        // Cursors are stored in window.__omniGeminiCursorMap so each subsequent call
+        // can pass the right cursor without re-fetching earlier pages.
+        //
+        // cursor flow:
+        //   offset=0  → cursor=null,           stores nextCursor at key 50
+        //   offset=50 → cursor=map[50],        stores nextCursor at key 100
+        //   offset=100→ cursor=map[100], ...
+        else if (adapter.name === 'Gemini') {
+            try {
+        // Persist cursor map across multiple GET_THREAD_LIST_OFFSET messages
+                if (!window.__omniGeminiCursorMap) window.__omniGeminiCursorMap = {};
+                // Reset cursor map when starting fresh (offset=0 = new Dashboard load)
+                if (offset === 0) window.__omniGeminiCursorMap = {};
+                const cursor   = window.__omniGeminiCursorMap[offset] ?? null;
+                const pageNum  = Math.floor(offset / limit) + 1;
+
+                const result = await adapter.getThreads(pageNum, limit, cursor);
+
+                // Store next cursor so the following page request can use it
+                if (result.nextCursor) {
+                    window.__omniGeminiCursorMap[offset + (result.threads?.length || limit)] = result.nextCursor;
+                }
+
+                const threads = result.threads || [];
+                const hasMore = result.hasMore === true && !!result.nextCursor;
+
+                console.log(`[Gemini] offset=${offset} got=${threads.length} hasMore=${hasMore}`);
+                sendResponse({ success: true, data: { threads, offset, hasMore } });
+            } catch (e) {
+                // No DOM fallback — Gemini's sidebar is virtualized and would
+                // silently return only the first handful of threads, hiding the
+                // rest of the user's history. Surface the real API failure so the
+                // user can act (refresh the tab, log back in, etc.).
+                console.error('[Gemini] MaZiqc API failed:', e.message);
+                sendResponse({
+                    success: false,
+                    error: `Gemini API unavailable: ${e.message}. Refresh the Gemini tab and try again.`
+                });
+            }
+        }
+        // CLAUDE: One V2 API call per message.
+        //
+        // Problem with getThreadsWithOffset: calls getAllThreads() which loops all pages
+        // inside one Chrome message → timeout.
+        //
+        // HAR-verified V2 shape: GET .../conversations/v2?...&offset=N
+        // Response: { data: [...50 convos...], has_more: bool }
+        // No cursor field — pure offset-based, one fetch per message.
+        else if (adapter.name === 'Claude') {
+            try {
+                if (typeof ClaudeAdapter === 'undefined') throw new Error('ClaudeAdapter not loaded');
+                const orgId   = await ClaudeAdapter.getOrgId();
+                const baseUrl = platformConfig.getBaseUrl('Claude');
+                const v2Ep    = platformConfig.buildEndpoint('Claude', 'conversationsV2', { org: orgId });
+                // V2 uses &offset=N (not cursor=uuid — that returns same page forever)
+                const url = `${baseUrl}${v2Ep}&offset=${offset}`;
+
+                const resp = await ClaudeAdapter._fetchWithRetry(url);
+                const data = await resp.json();
+
+                const page    = Array.isArray(data.data) ? data.data : [];
+                const threads = page.map(t => ({
+                    uuid:                t.uuid,
+                    title:               t.name || DataExtractor.extractTitle(t, 'Claude') || 'Untitled',
+                    last_query_datetime: t.updated_at,
+                    model:               t.model || null,
+                    is_starred:          t.is_starred || false
+                }));
+                const hasMore = data.has_more === true;
+
+                console.log(`[Claude] offset=${offset} got=${threads.length} hasMore=${hasMore}`);
+                sendResponse({ success: true, data: { threads, offset, hasMore } });
+            } catch (e) {
+                console.error('[Claude] direct V2 failed:', e.message);
+                sendResponse({ success: false, error: e.message });
+            }
+        }
+        // Grok support (HAR-verified endpoints)
+        else if (adapter.name === 'Grok') {
+            try {
+                // Grok API only returns pageSize=60 conversations at a time.
+                // For offsets beyond 60, we need to use Grok's native cursor-based pagination
+                // or document the 60-thread limit. Currently documenting the limit and using
+                // in-memory cache to avoid breaking pagination.
+
+                // Try to use cached data if available and fresh
+                const cacheValid = adapter._cacheTimestamp > Date.now() - adapter._cacheTTL;
+                let allChats = [];
+
+                if (cacheValid && adapter._allThreadsCache.length > 0) {
+                    allChats = adapter._allThreadsCache;
+                } else {
+                    // ?pageSize=60 required, fields are conversationId/modifyTime
+                    // Note: Grok API currently does not support cursor pagination in this endpoint
+                    // Maximum 60 conversations can be fetched per request
+                    const response = await fetch('https://grok.com/rest/app-chat/conversations?pageSize=60', {
+                        credentials: 'include',
+                        headers: {
+                            ...browserHeaders,
+                            'Accept': 'application/json',
+                            'Content-Type': 'application/json'
+                        }
+                    });
+
+                    if (response.ok) {
+                        const data = await response.json();
+                        // response is { conversations: [{conversationId, title, modifyTime, createTime}] }
+                        allChats = data.conversations || data.data || data.items || [];
+
+                        // Update cache
+                        adapter._allThreadsCache = allChats;
+                        adapter._cacheTimestamp = Date.now();
+                    } else {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+                }
+
+                // Now slice from the full cached list
+                const threads = allChats.slice(offset, offset + limit).map(t => ({
+                    // field is 'conversationId' not 'id'
+                    uuid: t.conversationId || t.id || t.uuid,
+                    title: t.title || t.name || 'Grok Chat',
+                    // fields are 'modifyTime' and 'createTime'
+                    last_query_datetime: t.modifyTime || t.createTime || t.updatedAt
+                }));
+
+                sendResponse({
+                    success: true,
+                    data: {
+                        threads,
+                        offset,
+                        hasMore: offset + limit < allChats.length,
+                        total: allChats.length,
+                        // Add warning if total exceeds 60 (API limitation)
+                        warning: allChats.length >= 60 ? 'Grok API returns maximum 60 conversations. Pagination beyond 60 is not supported.' : null
+                    }
+                });
+            } catch (e) {
+                console.warn('[Grok] API failed:', e.message);
+                try {
+                    const result = await adapter.getThreads(1, limit);
+                    sendResponse({ success: true, data: { threads: result.threads || result, offset: 0, hasMore: false } });
+                } catch (fallbackErr) {
+                    console.error('[Grok] Fallback also failed:', fallbackErr.message);
+                    sendResponse({ success: false, error: 'Grok: ' + fallbackErr.message });
+                }
+            }
+        }
+        // Generic fallback: adapters with getThreadsWithOffset (DeepSeek already handled above,
+        // Claude and Gemini also handled above — this covers any future adapter)
+        else if (adapter.getThreadsWithOffset) {
+            const result = await adapter.getThreadsWithOffset(offset, limit);
+            sendResponse({ success: true, data: result });
+        }
+        else if (payload.loadAll && adapter.getAllThreads) {
+            const threads = await adapter.getAllThreads();
+            sendResponse({
+                success: true,
+                data: {
+                    threads,
+                    offset: 0,
+                    hasMore: false,
+                    total: threads.length
+                }
+            });
+        }
+        else {
+            // Fallback to page-based for other platforms
+            const page = Math.floor(offset / limit) + 1;
+            const response = await adapter.getThreads(page, limit);
+            sendResponse({ success: true, data: response });
+        }
+    } catch (error) {
+        console.error('[handleGetThreadListOffset] Error:', error);
+        sendResponse({ success: false, error: error.message });
+    }
+}
+
+async function handleGetSpaces(adapter, sendResponse) {
+    try {
+        if (!adapter.getSpaces) return sendResponse({ success: true, data: [] });
+        const spaces = await adapter.getSpaces();
+        sendResponse({ success: true, data: spaces });
+    } catch (error) {
+        sendResponse({ success: false, error: error.message });
+    }
+}
+
+// --- Platform Detection & Adapters (Capability Validation) ---
+
+/**
+ * Validate adapter has required methods
+ */
+function validateAdapter(adapter) {
+    const required = ['name', 'extractUuid', 'getThreads', 'getThreadDetail'];
+    for (const method of required) {
+        if (!adapter[method]) {
+            console.error(`[OmniExporter] Adapter missing required method: ${method}`);
+            return false;
+        }
+    }
+    return true;
+}
+
+function getPlatformAdapter() {
+    const host = window.location.hostname;
+    let adapter = null;
+
+    if (host.includes("perplexity.ai")) {
+        adapter = typeof PerplexityAdapter !== 'undefined' ? PerplexityAdapter : null;
+    }
+    else if (host.includes("chatgpt.com") || host.includes("openai.com")) {
+        adapter = typeof ChatGPTAdapter !== 'undefined' ? ChatGPTAdapter : null;
+    }
+    else if (host.includes("claude.ai")) {
+        adapter = typeof ClaudeAdapter !== 'undefined' ? ClaudeAdapter : null;
+    }
+    else if (host.includes("gemini.google.com")) {
+        adapter = window.GeminiAdapter || null;
+    }
+    else if (host.includes("grok.com") || host.includes("x.com")) {
+        adapter = window.GrokAdapter || null;
+    }
+    else if (host.includes("chat.deepseek.com") || host.includes("deepseek.com")) {
+        adapter = window.DeepSeekAdapter || null;
+    }
+
+    if (adapter && !validateAdapter(adapter)) {
+        return null;
+    }
+
+    return adapter;
+}
+
+// --- Helper Functions ---
+
+// ============================================
+// RESILIENT EXTRACTION HELPERS
+// ============================================
+
+// ============================================
+// AUTO-VERSION DETECTION ON LOAD
+// ============================================
+async function initializePlatformAdapters() {
+    try {
+        const adapter = getPlatformAdapter();
+        if (adapter && typeof versionDetector !== 'undefined') {
+            const detectedVersion = await versionDetector.detect(adapter.name);
+            if (typeof platformConfig !== 'undefined') {
+                platformConfig.setActiveVersion(adapter.name, detectedVersion);
+            }
+            console.log(`[OmniExporter] Detected ${adapter.name} version: ${detectedVersion}`);
+        }
+    } catch (e) {
+        console.warn('[OmniExporter] Version detection failed:', e);
+    }
+}
+
+// Initialize version detection after DOM ready
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initializePlatformAdapters);
+} else {
+    initializePlatformAdapters();
+}
+
+} // end if (!window.__omniExporterLoaded)
+
