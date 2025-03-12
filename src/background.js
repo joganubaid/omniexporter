@@ -1,0 +1,1149 @@
+// OmniExporter — background service worker.
+// Version is sourced from manifest.json; do not duplicate it here.
+"use strict";
+
+try {
+    // background.js lives in src/ — paths are relative to src/
+    importScripts('utils/logger.js');
+} catch (e) {
+    console.error("[OmniExporter] Failed to load logger.js:", e);
+}
+
+// Logger fallback stub — if logger.js failed to load, define a no-op Logger
+// so the rest of the service worker doesn't crash with "Logger is not defined"
+if (typeof Logger === 'undefined') {
+    console.warn("[OmniExporter] Logger not available, using fallback stub");
+    var Logger = {
+        _stub: true,
+        config: { enabled: false },
+        init() { return Promise.resolve(); },
+        info() {},
+        warn() {},
+        error(mod, msg, data) { console.error(`[${mod}]`, msg, data || ''); },
+        debug() {},
+        receiveLog() {},
+        time() { return { end() { return 0; } }; }
+    };
+}
+
+// config.js is a root-level, committed configuration file.
+// The extension still falls back to defaults from auth/notion-oauth.js if config.js is missing
+// (for example, in custom builds or constrained deployment environments).
+// NOTE: background.js lives at src/background.js, so the service-worker URL is
+// chrome-extension://{id}/src/background.js.  importScripts() paths resolve relative
+// to that URL, so 'config.js' would look for src/config.js (wrong).
+// The root-level config.js must be referenced as '../config.js'.
+try {
+    importScripts('../config.js');
+} catch (e) {
+    console.warn("[OmniExporter] config.js not found — using default configuration. Copy config.example.js to config.js to customize.");
+}
+
+try {
+    // auth/ is at root level — one level up from src/
+    importScripts('../auth/notion-oauth.js');
+} catch (e) {
+    console.error("[OmniExporter] Failed to load auth/notion-oauth.js:", e);
+}
+
+try {
+    importScripts('utils/notion-block-builder.js');
+} catch (e) {
+    console.warn("[OmniExporter] notion-block-builder.js not found — using basic block generation");
+}
+
+try {
+    importScripts('utils/shared-utils.js');
+} catch (e) {
+    console.warn("[OmniExporter] shared-utils.js not found — some utilities may be unavailable");
+}
+
+// Initialize logger for background script
+Logger.init().then(() => {
+    Logger.info('System', 'OmniExporter Service Worker Active');
+}).catch(e => console.error('Logger init failed:', e));
+
+console.log("OmniExporter Service Worker Active");
+
+// MV3 service-worker lifecycle note:
+// The SW terminates after ~30s of inactivity. We do NOT use a "keep-alive"
+// alarm to fight this — empty alarms only briefly wake the worker, they don't
+// prevent termination once the event queue drains. All state lives in
+// chrome.storage and the SW is re-spawned automatically when:
+//   - chrome.runtime.onMessage fires (content scripts / popup)
+//   - chrome.alarms.onAlarm fires (autoSyncAlarm, storageCleanup)
+//   - chrome.commands / chrome.contextMenus / chrome.action events fire
+// That covers every code path we care about.
+
+chrome.runtime.onInstalled.addListener(() => {
+    console.log("OmniExporter Service Worker Installed");
+
+    // One-shot cleanup of legacy OAuth flow artifacts that older builds wrote
+    // to chrome.storage.local (they now live in chrome.storage.session).
+    chrome.storage.local.remove([
+        'notion_oauth_state',
+        'notion_oauth_state_created',
+        'notion_oauth_code_verifier'
+    ]);
+
+    // Move pre-v2 flat exportedUuids array into the per-platform legacy bucket
+    // so existing users don't re-upload everything after the upgrade. Idempotent.
+    if (typeof ExportedUuidStore !== 'undefined') {
+        ExportedUuidStore.migrateLegacyIfNeeded()
+            .then(migrated => migrated && console.log('[OmniExporter] Legacy exportedUuids migrated to per-platform store'))
+            .catch(e => console.warn('[OmniExporter] exportedUuids migration failed:', e.message));
+    }
+
+    chrome.storage.local.get(['autoSyncEnabled', 'syncInterval'], (res) => {
+        if (res.autoSyncEnabled) {
+            const interval = res.syncInterval || 60;
+            chrome.alarms.create('autoSyncAlarm', { periodInMinutes: interval });
+            console.log(`Auto-sync alarm set for every ${interval} minutes`);
+        }
+    });
+
+    setupContextMenus();
+});
+
+// onInstalled is NOT called on SW restart — re-register context menus here.
+// Also re-run the exportedUuids migration (it's idempotent, guarded by
+// `exportedUuids_migrated_v2` flag) so a user who reloads the extension
+// without ever uninstalling still gets migrated. Without this, the migration
+// only ever ran on install/update, which missed the SW-restart edge case.
+chrome.runtime.onStartup.addListener(() => {
+    setupContextMenus();
+    if (typeof ExportedUuidStore !== 'undefined') {
+        ExportedUuidStore.migrateLegacyIfNeeded()
+            .then(migrated => migrated && console.log('[OmniExporter] Legacy exportedUuids migrated on startup'))
+            .catch(e => console.warn('[OmniExporter] exportedUuids migration failed:', e.message));
+    }
+    Logger.info('System', 'Service worker started up');
+});
+
+/**
+ * Create context menus safely, removing any existing ones first.
+ * Called from both onInstalled and onStartup.
+ */
+function setupContextMenus() {
+    const docPatterns = [
+        'https://www.perplexity.ai/*',
+        'https://chatgpt.com/*',
+        'https://chat.openai.com/*',
+        'https://claude.ai/*',
+        'https://gemini.google.com/*',
+        'https://grok.com/*',
+        'https://x.com/i/grok/*',
+        'https://chat.deepseek.com/*'
+    ];
+    chrome.contextMenus.removeAll(() => {
+        chrome.contextMenus.create({
+            id: 'exportThread',
+            title: 'Export this thread with OmniExporter',
+            contexts: ['page'],
+            documentUrlPatterns: docPatterns
+        });
+    });
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === 'autoSyncAlarm') {
+        console.log("Auto-sync alarm triggered");
+        performAutoSync();
+    }
+
+    if (alarm.name === 'storageCleanup') {
+        enforceStorageLimit();
+    }
+});
+
+// Best-effort: clear any leftover keep-alive alarm from older builds so we
+// stop burning a wakeup every minute for nothing.
+chrome.alarms.clear('keepAlive');
+
+// getPlatformUrl comes from shared-utils.js (loaded via importScripts above).
+// We deliberately don't carry a fallback copy of the URL map here — if
+// shared-utils.js fails to load, the extension has bigger problems
+// (RateLimiter, ExportedUuidStore, etc. all live there), and a duplicate URL
+// map would just rot out of sync with the canonical PlatformUrlBuilder.
+
+// Sync lock is now validated against chrome.storage on every acquire.
+// Without this, if the SW terminates mid-sync and restarts, globalSyncInProgress resets to
+// false — allowing a new sync to start while the previous run’s Notion requests are still in-flight.
+let globalSyncInProgress = false;
+
+async function acquireSyncLock() {
+    // Check in-memory first (fastest path — same SW instance)
+    if (globalSyncInProgress) {
+        console.log('[Sync] Another sync is in progress (in-memory), skipping');
+        return false;
+    }
+    // TOCTOU FIX: Set in-memory flag BEFORE async storage read to prevent
+    // two simultaneous alarm callbacks from both passing the check.
+    globalSyncInProgress = true;
+
+    // Cross-restart check: verify storage state wasn’t left dirty by a crashed SW
+    const { syncInProgress, syncStartTime } = await chrome.storage.local.get(['syncInProgress', 'syncStartTime']);
+    if (syncInProgress) {
+        const age = Date.now() - (syncStartTime || 0);
+        // If lock is older than 10 minutes, treat as stale and override
+        if (age < 10 * 60 * 1000) {
+            console.log('[Sync] Sync in progress per storage (age: ' + Math.round(age/1000) + 's), skipping');
+            globalSyncInProgress = false; // Reset since we're not proceeding
+            return false;
+        }
+        console.warn('[Sync] Stale lock detected (' + Math.round(age/60000) + 'min), overriding');
+    }
+    await chrome.storage.local.set({ syncInProgress: true, syncStartTime: Date.now() });
+    return true;
+}
+
+async function releaseSyncLock() {
+    globalSyncInProgress = false;
+    await chrome.storage.local.set({ syncInProgress: false, syncStartTime: null });
+}
+
+// ============================================
+// ALARM CLEANUP ()
+// ============================================
+chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === 'local') {
+        // SECURITY: Clear logs when debug mode is disabled
+        if (changes.debugMode && changes.debugMode.newValue === false) {
+            console.log('[Security] Debug mode disabled - clearing all logs');
+            chrome.storage.local.remove([
+                'omniLogs',
+                'logEntries',
+                'testHistory',
+                'debugLogs'
+            ]);
+        }
+
+        // Handle Auto-Sync Toggle
+        if (changes.autoSyncEnabled) {
+            if (changes.autoSyncEnabled.newValue === true) {
+                // Enable: Create alarm
+                chrome.storage.local.get('syncInterval', (res) => {
+                    const interval = res.syncInterval || 60;
+                    chrome.alarms.create('autoSyncAlarm', { periodInMinutes: interval });
+                    console.log(`[Alarm] Auto-sync enabled. Alarm set for every ${interval} minutes`);
+                    performAutoSync(); // Trigger immediate sync
+                });
+            } else {
+                // Disable: Clear alarm
+                chrome.alarms.clear('autoSyncAlarm');
+                console.log('[Alarm] Auto-sync alarm cleared');
+            }
+        }
+
+        // Update alarm interval if changed
+        if (changes.syncInterval && changes.syncInterval.newValue) {
+            chrome.storage.local.get('autoSyncEnabled', (res) => {
+                if (res.autoSyncEnabled) {
+                    const interval = changes.syncInterval.newValue;
+                    chrome.alarms.create('autoSyncAlarm', { periodInMinutes: interval });
+                    console.log(`[Alarm] Interval updated to ${interval} minutes`);
+                }
+            });
+        }
+
+        // Clear alarm when Notion credentials removed
+        if ((changes.notionApiKey && !changes.notionApiKey.newValue) ||
+            (changes.notionKey && !changes.notionKey.newValue)) {
+            chrome.alarms.clear('autoSyncAlarm');
+            console.log('[Alarm] Alarm cleared - Notion key removed');
+        }
+    }
+});
+
+// ============================================
+// STORAGE LIMIT ENFORCEMENT (Prevent Memory Overflow)
+// ============================================
+async function enforceStorageLimit() {
+    try {
+        const MAX_STORAGE_MB = 5; // 5MB limit for logs
+        const bytes = await chrome.storage.local.getBytesInUse(['omniLogs']);
+        const mb = bytes / (1024 * 1024);
+
+        if (mb > MAX_STORAGE_MB) {
+            console.log(`[Security] Storage limit exceeded (${mb.toFixed(2)}MB > ${MAX_STORAGE_MB}MB) - trimming logs`);
+            const { omniLogs = [] } = await chrome.storage.local.get('omniLogs');
+            // Keep only last 50% of logs
+            const trimmed = omniLogs.slice(Math.floor(omniLogs.length / 2));
+            await chrome.storage.local.set({ omniLogs: trimmed });
+        }
+    } catch (e) {
+        console.warn('[Security] Storage limit check failed:', e.message);
+    }
+}
+
+// Guard alarm creation — SW restarts often and duplicate alarms cause errors.
+chrome.alarms.get('storageCleanup', (existing) => {
+    if (!existing) chrome.alarms.create('storageCleanup', { periodInMinutes: 5 });
+});
+
+// ============================================
+// AUTO-SYNC IMPLEMENTATION (Incremental with Checkpoints)
+// ============================================
+
+// Note: auth/notion-oauth.js is already loaded via importScripts at the top of this file.
+
+
+/**
+ * Get sync checkpoint for a platform
+ */
+async function getSyncCheckpoint(platform) {
+    const { syncCheckpoints = {} } = await chrome.storage.local.get('syncCheckpoints');
+    return syncCheckpoints[platform] || { lastSyncTime: 0, lastUuid: null };
+}
+
+/**
+ * Update sync checkpoint after successful sync
+ */
+async function updateSyncCheckpoint(platform, lastSyncTime, lastUuid) {
+    const { syncCheckpoints = {} } = await chrome.storage.local.get('syncCheckpoints');
+    syncCheckpoints[platform] = { lastSyncTime, lastUuid, updatedAt: Date.now() };
+    await chrome.storage.local.set({ syncCheckpoints });
+}
+
+/**
+ * Fetch threads from content script
+ * Note: We fetch ALL threads and let exportedUuids handle filtering
+ * This ensures threads that were never synced still get picked up
+ */
+async function fetchThreadsSinceCheckpoint(tabId, platform, checkpoint) {
+    return new Promise((resolve) => {
+        // Add timeout to prevent hanging
+        const timeout = setTimeout(() => {
+            console.warn('[AutoSync] Timeout waiting for content script response');
+            resolve({ threads: [], hasMore: false });
+        }, 30000);
+
+        chrome.tabs.sendMessage(tabId, {
+            type: 'GET_THREAD_LIST',
+            payload: { page: 1, limit: 50 }
+        }, (response) => {
+            clearTimeout(timeout);
+
+            if (chrome.runtime.lastError) {
+                console.error('[AutoSync] Message error:', chrome.runtime.lastError.message);
+                resolve({ threads: [], hasMore: false });
+                return;
+            }
+
+            if (!response || !response.success) {
+                console.warn('[AutoSync] Content script returned unsuccessful response:', response?.error);
+                resolve({ threads: [], hasMore: false });
+            } else {
+                // Return ALL threads - filtering by exportedUuids happens in performAutoSync
+                // This ensures threads that were never synced will be picked up
+                const threads = response.data.threads || [];
+                console.log(`[AutoSync] Content script returned ${threads.length} threads`);
+                resolve({ threads, hasMore: response.data.hasMore });
+            }
+        });
+    });
+}
+
+async function performAutoSync() {
+    // One trace ID per auto-sync run. Threaded through every Logger.* call
+    // and Notion fetch in this function so the dashboard's log viewer can
+    // group all related entries under one trace.
+    const traceId = Logger.startTrace('autosync');
+    const syncTimer = Logger.time('AutoSync', 'full sync run', traceId);
+    console.log(`[AutoSync] performAutoSync initiated (trace=${traceId})`);
+
+    // Totals across all platforms (for summary logging / recordSyncJob)
+    let totalThreads = 0;
+    let totalNewThreads = 0;
+    let totalSuccessCount = 0;
+    let totalFailedCount = 0;
+    // Acquire global lock before sync
+    if (!(await acquireSyncLock())) {
+        return; // Another sync is in progress
+    }
+
+    try {
+        const settings = await chrome.storage.local.get([
+            'autoSyncEnabled', 'autoSyncNotion', 'notionApiKey', 'notionKey', 'notionDbId', 'notion_auth_method'
+        ]);
+        // Stash trace ID on the settings bag so downstream syncToNotion gets it.
+        settings._traceId = traceId;
+
+        Logger.debug('AutoSync', 'Settings loaded', { enabled: settings.autoSyncEnabled, dbId: settings.notionDbId ? 'Present' : 'Missing', notionAuth: settings.notion_auth_method }, { traceId });
+
+        if (!settings.autoSyncEnabled || !settings.notionDbId) {
+            Logger.warn('AutoSync', 'Skipped: Not configured or disabled');
+            await releaseSyncLock();
+            return;
+        }
+
+        if (typeof NotionOAuth === 'undefined') {
+            console.log("[AutoSync] Skipped: OAuth module not loaded");
+            await releaseSyncLock();
+            return;
+        }
+
+        let authToken;
+        try {
+            // Background context — never pop a login window unprompted.
+            // If the token has expired, getActiveToken throws NOTION_REAUTH_REQUIRED
+            // and we surface the state via badge + storage flag so the user can
+            // reconnect on their own time.
+            authToken = await NotionOAuth.getActiveToken({ interactive: false });
+        } catch (error) {
+            const isReauth = error.message && error.message.includes('NOTION_REAUTH_REQUIRED');
+            if (isReauth) {
+                chrome.action.setBadgeText({ text: '🔒' });
+                chrome.action.setBadgeBackgroundColor({ color: '#ef4444' });
+                chrome.action.setTitle({
+                    title: 'OmniExporter — Notion session expired. Click to reconnect.'
+                });
+                // Only log the failure once per reauth-required state to avoid
+                // filling the failure log with one entry per alarm fire.
+                const { notion_reauth_logged } = await chrome.storage.local.get('notion_reauth_logged');
+                if (!notion_reauth_logged) {
+                    await trackFailure({ uuid: '_auth_', reason: 'Notion session expired — reconnect required', platform: 'Notion' });
+                    await chrome.storage.local.set({ notion_reauth_logged: true });
+                }
+            } else {
+                await trackFailure({ uuid: '_auth_', reason: 'Notion auth: ' + error.message, platform: 'Notion' });
+            }
+            Logger.warn('AutoSync', 'Notion auth unavailable — skipped sync', { error: error.message, reauth: isReauth });
+            await releaseSyncLock();
+            return;
+        }
+
+        Logger.info('AutoSync', 'Starting incremental sync...');
+
+        try {
+            // Find AI platform tabs - ALL 6 PLATFORMS
+            const tabs = await chrome.tabs.query({
+                url: [
+                    "https://www.perplexity.ai/*",
+                    "https://chatgpt.com/*",
+                    "https://chat.openai.com/*",
+                    "https://claude.ai/*",
+                    "https://gemini.google.com/*",
+                    "https://grok.com/*",
+                    "https://x.com/i/grok/*",
+                    "https://chat.deepseek.com/*"
+                ]
+            });
+
+            if (tabs.length === 0) {
+                console.log("[AutoSync] ❌ No AI platform tabs found - open an AI site first!");
+                await recordSyncJob(0, 0, 0); // Log that we checked
+                await releaseSyncLock(); // FIX: Release lock before returning
+                return;
+            }
+
+            Logger.info('AutoSync', `Found ${tabs.length} AI platform tab(s)`, { platforms: tabs.map(t => t.url.split('/')[2]) });
+
+            // Iterate all open AI tabs instead of only the first.
+            // Build a map of platform -> tab so each platform is processed once per run.
+            // Prefer tabs whose URL includes a conversation/chat path over landing pages.
+            const platformTabMap = new Map();
+            const chatPathPatterns = ['/c/', '/chat/', '/conversation/', '/thread/'];
+            for (const t of tabs) {
+                const p = t.url.includes('perplexity') ? 'Perplexity'
+                    : t.url.includes('chatgpt') || t.url.includes('openai') ? 'ChatGPT'
+                    : t.url.includes('claude') ? 'Claude'
+                    : t.url.includes('gemini') ? 'Gemini'
+                    : t.url.includes('grok') || t.url.includes('x.com') ? 'Grok'
+                    : t.url.includes('deepseek') ? 'DeepSeek'
+                    : null;
+                if (!p) continue;
+                const isOnChatPage = chatPathPatterns.some(pat => t.url.includes(pat));
+                const existing = platformTabMap.get(p);
+                // Replace if no tab yet, or if new tab is on a chat page and old one isn't
+                if (!existing || (isOnChatPage && !chatPathPatterns.some(pat => existing.url.includes(pat)))) {
+                    platformTabMap.set(p, t);
+                }
+            }
+
+            // Pre-v2 legacy bucket — UUIDs from before per-platform split (no
+            // platform info). Read once per run; checked alongside each
+            // platform's cache for dedup, never written to.
+            const legacyDedupSet = await ExportedUuidStore.loadLegacy();
+
+            // Process each unique platform tab
+            for (const [platform, tab] of platformTabMap) {
+
+            // Load this platform's exported-UUID cache as Map<uuid, lastSyncedMs>.
+            // Mutated in memory and persisted after each batch + at end.
+            const platformCache = await ExportedUuidStore.load(platform);
+            // Track legacy → platform promotions so we can shrink the legacy
+            // bucket at end of run. Without this, "Clear cache" on a platform
+            // can't reach the user's pre-v2 history (it lives in the legacy
+            // bucket, not the per-platform cache).
+            const promotedFromLegacy = [];
+            const isAlreadyExported = (uuid) => {
+                if (platformCache.has(uuid)) return true;
+                if (legacyDedupSet.has(uuid)) {
+                    platformCache.set(uuid, Date.now());
+                    legacyDedupSet.delete(uuid);
+                    promotedFromLegacy.push(uuid);
+                    return true;
+                }
+                return false;
+            };
+
+            // Get checkpoint for this platform
+            const checkpoint = await getSyncCheckpoint(platform);
+            console.log(`[AutoSync] Checkpoint for ${platform}:`, checkpoint);
+
+            // Fetch only new threads since checkpoint
+            console.log(`[AutoSync] Fetching threads from ${platform}...`);
+            let threads;
+            try {
+                const result = await fetchThreadsSinceCheckpoint(tab.id, platform, checkpoint);
+                threads = result.threads || [];
+                Logger.info('AutoSync', `Fetched ${threads.length} threads from content script`, { platform });
+            } catch (fetchError) {
+                Logger.error('AutoSync', 'Failed to fetch threads', { error: fetchError.message });
+                await recordSyncJob(threads?.length || 0, 0, 1, 0);
+                continue;
+            }
+
+            const newThreads = threads.filter(t => !isAlreadyExported(t.uuid));
+
+            Logger.info('AutoSync', `Found ${newThreads.length} new threads since checkpoint`,
+                { total: threads.length, newCount: newThreads.length, platform });
+
+            // Retry list: failed UUIDs from PREVIOUS runs that are not yet
+            // exported and have fewer than 3 attempts. syncFailures[platform]
+            // is a {uuid → attemptCount} map written by trackFailure().
+            const { syncFailures = {} } = await chrome.storage.local.get('syncFailures');
+            let platformFailures = {};
+            const maybePlatformFailures = syncFailures && typeof syncFailures[platform] === 'object'
+                ? syncFailures[platform]
+                : null;
+            if (maybePlatformFailures && Object.values(maybePlatformFailures).every(v => typeof v === 'number')) {
+                platformFailures = maybePlatformFailures;
+            }
+            const retryUuids = Object.entries(platformFailures)
+                .filter(([uuid, count]) => !isAlreadyExported(uuid) && count < 3)
+                .map(([uuid]) => uuid);
+
+            // Merge: newThreads + any retry UUID not already in newThreads
+            const newUuidSet = new Set(newThreads.map(t => t.uuid));
+            for (const uuid of retryUuids) {
+                if (!newUuidSet.has(uuid)) {
+                    // We don't have full thread metadata from storage — use minimal stub
+                    // so EXTRACT_CONTENT_BY_UUID can fetch full detail
+                    newThreads.push({ uuid, title: `(retry) ${uuid}`, platform });
+                    newUuidSet.add(uuid);
+                }
+            }
+
+            if (newThreads.length === 0) {
+                await updateSyncCheckpoint(platform, Date.now(), null);
+                await recordSyncJob(threads.length, 0, 0, 0);
+                continue;
+            }
+
+            let successCount = 0, failedCount = 0;
+            // Removed Math.min(..., 10) cap — MAX_THREADS_PER_RUN controls the limit.
+            const BATCH_SIZE = 5;
+            const MAX_THREADS_PER_RUN = 50;
+
+            // Process in batches — no artificial 10-thread cap
+            for (let i = 0; i < Math.min(newThreads.length, MAX_THREADS_PER_RUN); i += BATCH_SIZE) {
+                const batch = newThreads.slice(i, i + BATCH_SIZE);
+                console.log(`[AutoSync] Processing batch ${Math.floor(i / BATCH_SIZE) + 1}...`);
+
+                for (const thread of batch) {
+                    try {
+                        const detailResponse = await new Promise((resolve) => {
+                            const timeout = setTimeout(() => {
+                                console.warn(`[AutoSync] Timeout extracting thread ${thread.uuid}`);
+                                resolve(null);
+                            }, 30000);
+
+                            chrome.tabs.sendMessage(tab.id, {
+                                type: 'EXTRACT_CONTENT_BY_UUID',
+                                payload: { uuid: thread.uuid }
+                            }, (response) => {
+                                clearTimeout(timeout);
+                                if (chrome.runtime.lastError) {
+                                    console.warn('[AutoSync] sendMessage error:', chrome.runtime.lastError.message);
+                                    resolve(null);
+                                } else {
+                                    resolve(response);
+                                }
+                            });
+                        });
+
+                        if (!detailResponse || !detailResponse.success) {
+                            failedCount++;
+                            await trackFailure({
+                                uuid: thread.uuid,
+                                reason: detailResponse?.error || 'Failed to extract',
+                                platform
+                            });
+                            continue;
+                        }
+
+                        console.log(`[AutoSync] Syncing thread "${detailResponse.data?.title || thread.uuid}" to Notion...`);
+                        const syncResult = await syncToNotion(detailResponse.data, settings);
+
+                        if (syncResult.success) {
+                            successCount++;
+                            totalSuccessCount++;
+                            platformCache.set(thread.uuid, Date.now());
+                        } else {
+                            failedCount++;
+                            totalFailedCount++;
+                            await trackFailure({
+                                uuid: thread.uuid,
+                                reason: syncResult.error || 'Notion sync failed',
+                                platform
+                            });
+                        }
+
+                        // Rate limiting
+                        await new Promise(r => setTimeout(r, 1000));
+
+                    } catch (e) {
+                        failedCount++;
+                        totalFailedCount++;
+                        console.error(`[AutoSync] Error syncing ${thread.uuid}:`, e);
+                        // Show red badge on auth errors so user knows they need to log in.
+                        if (e.message && e.message.includes('Authentication required')) {
+                            chrome.action.setBadgeText({ text: '🔒' });
+                            chrome.action.setBadgeBackgroundColor({ color: '#ef4444' }); // red
+                        }
+                    }
+                }
+
+                // Brief pause between batches
+                await new Promise(r => setTimeout(r, 2000));
+
+                // Persist this platform's cache after each batch so progress
+                // isn't lost if Chrome suspends the SW mid-sync.
+                await ExportedUuidStore.save(platform, platformCache);
+            }
+
+            // Update checkpoint
+            await updateSyncCheckpoint(platform, Date.now(), newThreads[0]?.uuid);
+
+            // Final persist for this platform (catches the last partial batch).
+            await ExportedUuidStore.save(platform, platformCache);
+
+            // Drain the legacy bucket for UUIDs we just promoted to per-platform.
+            if (promotedFromLegacy.length) {
+                await ExportedUuidStore.forgetLegacy(promotedFromLegacy);
+                Logger.info('AutoSync', `Promoted ${promotedFromLegacy.length} legacy UUID(s) to ${platform} cache`);
+            }
+
+            totalNewThreads += newThreads.length;
+            totalThreads += threads.length;
+
+            } // end for (const [platform, tab] of platformTabMap)
+
+            await chrome.storage.local.set({ lastSyncDate: new Date().toISOString() });
+
+            // Pass total threads (including already-exported) so skipped is correct
+            // recordSyncJob will compute skipped = total - attempted
+            await recordSyncJob(
+                totalThreads || totalNewThreads,
+                totalSuccessCount,
+                totalFailedCount,
+                totalNewThreads
+            );
+            Logger.info('AutoSync', `All platforms complete: ${totalSuccessCount} synced, ${totalFailedCount} failed`,
+                { totalSuccessCount, totalFailedCount, totalThreads, totalNewThreads }, { traceId });
+
+            // update badge with newly synced thread count
+            const badgeText = totalSuccessCount > 0 ? String(totalSuccessCount) : '';
+            chrome.action.setBadgeText({ text: badgeText });
+            if (totalSuccessCount > 0) {
+                chrome.action.setBadgeBackgroundColor({ color: '#22c55e' }); // green
+                // Auto-clear badge after 30 seconds
+                setTimeout(() => chrome.action.setBadgeText({ text: '' }), 30000);
+            }
+
+
+        } catch (e) {
+            Logger.error('AutoSync', 'Sync run failed', { error: e.message }, { traceId });
+        }
+    } finally {
+        // Always release the lock (runs even on early errors)
+        await releaseSyncLock();
+        syncTimer.end({ totalSuccessCount, totalFailedCount });
+    }
+}
+
+// ============================================
+// NOTION DATABASE SCHEMA CACHE
+// ============================================
+//
+// syncToNotion needs the Notion DB schema to know which optional properties
+// (URL, Tags, Platform, Chat Time, Exported, …) exist, what their types are,
+// and what name the title property uses. The schema rarely changes — once the
+// user has set up their database the columns are stable for weeks at a time.
+//
+// We cache the schema in chrome.storage.local under `notion_db_schema_<dbId>`
+// so that:
+//   - A 50-thread auto-sync makes ONE schema fetch instead of 50.
+//   - First sync after SW restart pulls schema once, then reuses.
+//   - User can force a refresh whenever they change DB columns (call with
+//     {refresh: true}).
+//
+// Cache invalidation triggers (all wired up below):
+//   1. TTL: 24 hours. Long enough to amortize, short enough that a forgotten
+//      column rename heals on its own within a day.
+//   2. notionDbId changes → cache cleared (storage.onChanged listener).
+//   3. notion_auth_method changes → cache cleared (different workspace likely).
+//   4. Schema fetch returns 401/403/404 during normal use → cache invalidated
+//      automatically so the next call re-fetches.
+//   5. Explicit {refresh: true} param → bypasses cache.
+//
+const NOTION_SCHEMA_TTL_MS = 24 * 60 * 60 * 1000;
+
+async function getCachedNotionSchema(token, dbId, { refresh = false, traceId = null } = {}) {
+    if (!dbId) return null;
+    const cacheKey = `notion_db_schema_${dbId}`;
+
+    if (!refresh) {
+        const { [cacheKey]: cached } = await chrome.storage.local.get(cacheKey);
+        if (cached && cached.schema && cached.cachedAt &&
+            (Date.now() - cached.cachedAt) < NOTION_SCHEMA_TTL_MS) {
+            Logger.debug('Notion', `Schema cache hit (age ${Math.round((Date.now() - cached.cachedAt) / 1000)}s)`,
+                { dbId, ageSec: Math.round((Date.now() - cached.cachedAt) / 1000) }, { traceId });
+            return cached.schema;
+        }
+    }
+
+    const response = await notionFetchWithBackoff(
+        `https://api.notion.com/v1/databases/${dbId}`,
+        { headers: { 'Authorization': `Bearer ${token}`, 'Notion-Version': '2022-06-28' } },
+        4,
+        traceId
+    );
+
+    if (!response.ok) {
+        // Auth/missing-db failures should NOT poison the cache. Drop any stale
+        // entry and surface the failure to the caller (which falls back to
+        // schema-less property mapping).
+        if (response.status === 401 || response.status === 403 || response.status === 404) {
+            await chrome.storage.local.remove(cacheKey);
+        }
+        Logger.warn('Notion', `DB schema fetch failed (HTTP ${response.status}) for db ${dbId}`,
+            { status: response.status, dbId }, { traceId });
+        return null;
+    }
+
+    const schema = await response.json();
+    await chrome.storage.local.set({ [cacheKey]: { schema, cachedAt: Date.now() } });
+    Logger.debug('Notion', 'Schema fetched + cached', { dbId, columns: Object.keys(schema.properties || {}).length }, { traceId });
+    return schema;
+}
+
+// Wipe the schema cache when the user changes the target DB or switches auth
+// methods — the cached schema almost certainly doesn't apply anymore.
+chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== 'local') return;
+
+    if (changes.notionDbId) {
+        if (changes.notionDbId.oldValue) {
+            chrome.storage.local.remove(`notion_db_schema_${changes.notionDbId.oldValue}`);
+        }
+    }
+    if (changes.notion_auth_method) {
+        // Drop every cached schema — auth change implies workspace change.
+        chrome.storage.local.get(null, items => {
+            const keys = Object.keys(items).filter(k => k.startsWith('notion_db_schema_'));
+            if (keys.length) chrome.storage.local.remove(keys);
+        });
+    }
+});
+
+/**
+ * Notion-specific fetch with exponential backoff + jitter on 429/503.
+ * Notion rate-limits at ~3 requests/second. A flat 1s delay is not retry logic.
+ * maxRetries is the number of *retries* (not total attempts), so total attempts = maxRetries + 1.
+ *
+ * Uses Logger.tracedFetch for each attempt — logs method, scrubbed URL,
+ * status, duration. Pass a `traceId` so the entries can be grouped under
+ * the originating auto-sync run.
+ */
+async function notionFetchWithBackoff(url, options, maxRetries = 4, traceId = null) {
+    let delay = 1000;
+    const totalAttempts = maxRetries + 1;
+    for (let attempt = 0; attempt < totalAttempts; attempt++) {
+        const response = await Logger.tracedFetch(url, options, {
+            module: 'Notion',
+            traceId,
+            label: `notion attempt ${attempt + 1}/${totalAttempts}`
+        });
+        if (response.status !== 429 && response.status !== 503) return response;
+        if (attempt === maxRetries) {
+            Logger.warn('Notion', `Rate limited (${response.status}) — max retries exhausted (${totalAttempts} attempts). Returning last response.`,
+                null, { traceId });
+            return response;
+        }
+        const retryAfter = parseInt(response.headers.get('Retry-After') || '0', 10);
+        // ±25% full jitter. Without it, two clients that hit 429 at the same
+        // moment compute the same backoff and re-collide on retry (thundering
+        // herd). Randomising the wait spreads them out.
+        const base = retryAfter > 0 ? retryAfter * 1000 : delay;
+        const wait = Math.round(base * (0.75 + Math.random() * 0.5));
+        Logger.warn('Notion', `Rate limited (${response.status}), waiting ${wait}ms (attempt ${attempt + 1}/${totalAttempts})`,
+            { wait, attempt }, { traceId });
+        await new Promise(r => setTimeout(r, wait));
+        delay = Math.min(delay * 2, 30000); // cap at 30s before jitter
+    }
+}
+
+async function syncToNotion(data, settings) {
+    // Inherit the trace ID from performAutoSync (stashed on settings) so all
+    // Notion API calls for this thread group under the same auto-sync run.
+    const traceId = settings?._traceId || Logger.startTrace('manual-sync');
+    try {
+        const entries = data.detail?.entries || [];
+        const children = [];
+        // Called only from the auto-sync alarm path — never pop a login window mid-sync.
+        // If the cached token expired between performAutoSync's auth check and now,
+        // bubble up NOTION_REAUTH_REQUIRED so the caller can badge and skip.
+        const token = await NotionOAuth.getActiveToken({ interactive: false });
+        const notionHeaders = {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'Notion-Version': '2022-06-28'
+        };
+
+        // Schema is cached for 24h; this is a no-op on warm cache. See
+        // getCachedNotionSchema for invalidation rules.
+        let dbSchema = null;
+        try {
+            dbSchema = await getCachedNotionSchema(token, settings.notionDbId, { traceId });
+        } catch (schemaErr) {
+            Logger.warn('Notion', 'Schema fetch threw, falling back to defaults',
+                { error: schemaErr.message }, { traceId });
+        }
+
+        // Find the title property (could be named differently)
+        let titlePropertyName = 'Title';
+        if (dbSchema?.properties) {
+            for (const [name, prop] of Object.entries(dbSchema.properties)) {
+                if (prop.type === 'title') { titlePropertyName = name; break; }
+            }
+        }
+
+        const properties = {};
+        properties[titlePropertyName] = {
+            title: [{ type: "text", text: { content: (data.title || "Untitled").slice(0, 2000) } }]
+        };
+
+        if (dbSchema?.properties) {
+            if (dbSchema.properties['URL']?.type === 'url') {
+                const platformUrl = getPlatformUrl(data.platform, data.uuid);
+                if (platformUrl) {
+                    properties['URL'] = { url: platformUrl };
+                }
+            }
+            if (dbSchema.properties['Tags']?.type === 'multi_select')
+                properties['Tags'] = { multi_select: [{ name: data.platform || 'AI' }] };
+            if (dbSchema.properties['Platform']?.type === 'select')
+                properties['Platform'] = { select: { name: data.platform || 'AI' } };
+            if (dbSchema.properties['Chat Time']?.type === 'date') {
+                const rawDate = data.detail?.last_query_datetime
+                    || data.detail?.entries?.[0]?.created_datetime
+                    || data.detail?.entries?.[0]?.last_query_datetime;
+                const chatDate = rawDate
+                    ? new Date(rawDate).toISOString().split('T')[0]
+                    : new Date().toISOString().split('T')[0];
+                properties['Chat Time'] = { date: { start: chatDate } };
+            }
+            if (dbSchema.properties['Exported']?.type === 'date')
+                properties['Exported'] = { date: { start: new Date().toISOString().split('T')[0] } };
+        }
+
+        // Use rich block builder if available, otherwise fall back to basic blocks
+        if (typeof NotionBlockBuilder !== 'undefined') {
+            const richBlocks = NotionBlockBuilder.buildNotionBlocks(entries, data.platform || 'AI', {
+                title: data.title,
+                url: getPlatformUrl(data.platform, data.uuid),
+                model: data.detail?.model || '',
+                exportDate: new Date().toISOString().split('T')[0]
+            });
+            richBlocks.forEach(b => children.push(b));
+        } else {
+            // Fallback: basic block generation (pre-v5.3 behavior)
+            children.push({
+                type: "callout",
+                callout: {
+                    icon: { emoji: "🤖" },
+                    color: "blue_background",
+                    rich_text: [{ type: "text", text: { content: `Auto-synced from ${data.platform || 'AI'} at ${new Date().toLocaleString()}` } }]
+                }
+            });
+            children.push({ type: "divider", divider: {} });
+
+            entries.forEach((entry) => {
+                const query = entry.query || entry.query_str || '';
+                if (query) {
+                    children.push({
+                        type: "heading_2",
+                        heading_2: { rich_text: [{ type: "text", text: { content: query.slice(0, 2000) } }] }
+                    });
+                }
+                let answer = '';
+                if (entry.blocks && Array.isArray(entry.blocks)) {
+                    entry.blocks.forEach(block => {
+                        if (block.markdown_block) {
+                            answer += (block.markdown_block.answer || block.markdown_block.chunks?.join('\n') || '') + '\n\n';
+                        }
+                    });
+                }
+                if (!answer.trim()) answer = entry.answer || entry.text || '';
+
+                if (answer.trim()) {
+                    children.push({
+                        type: "paragraph",
+                        paragraph: { rich_text: [{ type: "text", text: { content: answer.slice(0, 1900) } }] }
+                    });
+                }
+            });
+        }
+
+        console.log('[AutoSync] Creating page with', children.length, 'blocks');
+
+        // POST the first 100 blocks only (Notion per-request limit).
+        // Then PATCH /v1/blocks/{page_id}/children for any remaining blocks in batches of 100.
+        const firstBatch = children.slice(0, 100);
+        const response = await notionFetchWithBackoff('https://api.notion.com/v1/pages', {
+            method: 'POST',
+            headers: notionHeaders,
+            body: JSON.stringify({
+                parent: { database_id: settings.notionDbId },
+                properties,
+                children: firstBatch
+            })
+        }, 4, traceId);
+
+        // Check content-type before calling .json() — Cloudflare Turnstile
+        // challenges return text/html on captcha-blocked endpoints, which throws on .json().
+        const contentType = response.headers.get('content-type') || '';
+        if (!response.ok) {
+            let errMsg = `HTTP ${response.status}`;
+            if (contentType.includes('application/json')) {
+                const err = await response.json();
+                errMsg = err.message || err.code || errMsg;
+                console.error('[AutoSync] Notion API Error:', err);
+            } else {
+                const text = await response.text();
+                // HTML response = likely Cloudflare challenge / bot detection
+                if (text.includes('<html')) {
+                    errMsg = 'Cloudflare challenge detected — please open the Notion tab and refresh';
+                    console.warn('[AutoSync] Notion returned HTML (likely Cloudflare block)');
+                } else {
+                    errMsg = text.slice(0, 200);
+                }
+            }
+            return { success: false, error: errMsg };
+        }
+
+        const pageData = contentType.includes('application/json') ? await response.json() : null;
+        const pageId = pageData?.id;
+
+        // Fail fast when we cannot determine the page ID — without it we cannot
+        // append additional blocks and the sync outcome would be unknown.
+        if (!pageId) {
+            const errMsg = pageData
+                ? 'Notion page created but no ID returned — cannot append additional blocks.'
+                : 'Notion returned a non-JSON response — cannot determine page ID. Possible Cloudflare challenge.';
+            console.error('[AutoSync]', errMsg);
+            return { success: false, error: errMsg };
+        }
+
+        // Append remaining blocks in batches of 100 if page was created successfully
+        if (children.length > 100) {
+            for (let i = 100; i < children.length; i += 100) {
+                const batch = children.slice(i, i + 100);
+                // Flatten toggle blocks before PATCH - Notion API doesn't accept nested children in PATCH
+                const flattenedBatch = typeof NotionBlockBuilder !== 'undefined' && NotionBlockBuilder.flattenToggleBlocks
+                    ? NotionBlockBuilder.flattenToggleBlocks(batch)
+                    : batch;
+                await new Promise(r => setTimeout(r, 350)); // Notion rate limit
+                try {
+                    const patchResp = await notionFetchWithBackoff(
+                        `https://api.notion.com/v1/blocks/${pageId}/children`,
+                        {
+                            method: 'PATCH',
+                            headers: notionHeaders,
+                            body: JSON.stringify({ children: flattenedBatch })
+                        },
+                        4,
+                        traceId
+                    );
+                    if (!patchResp.ok) {
+                        console.warn(`[AutoSync] Failed to append block batch ${i}–${i + batch.length} (status: ${patchResp.status})`);
+                        break; // partial append — don't fail the whole sync
+                    }
+                } catch (batchErr) {
+                    console.error(`[AutoSync] Batch append threw at ${i}–${i + batch.length}:`, batchErr.message);
+                    break; // Stop appending, but don't fail the entire sync
+                }
+            }
+        }
+
+        console.log('[AutoSync] ✓ Page created successfully', pageId ? `(id: ${pageId})` : '');
+        return { success: true };
+    } catch (e) {
+        console.error('[AutoSync] syncToNotion exception:', e);
+        return { success: false, error: e.message };
+    }
+}
+
+// 4th param `attempted` = threads actually processed (new + retry).
+// `total` should be the full threads.length including already-exported ones.
+// skipped = total - attempted (shows how many were already exported).
+async function recordSyncJob(total, success, failed, attempted = total) {
+    const { exportHistory = [] } = await chrome.storage.local.get('exportHistory');
+
+    exportHistory.unshift({
+        timestamp: new Date().toISOString(),
+        total,
+        attempted,
+        success,
+        failed,
+        skipped: total - attempted,
+        platform: 'AutoSync',
+        type: 'auto'
+    });
+
+    // Keep last 50 entries
+    if (exportHistory.length > 50) exportHistory.length = 50;
+
+    await chrome.storage.local.set({ exportHistory });
+}
+
+// ============================================
+// MESSAGE HANDLERS
+// ============================================
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    // SEC: Only accept messages from this extension's own content scripts
+    if (sender.id !== chrome.runtime.id) {
+        return false;
+    }
+
+    // Handle logs from content scripts
+    if (request.type === "LOGGER_STORE_LOG") {
+        if (typeof Logger !== 'undefined' && Logger.receiveLog) {
+            Logger.receiveLog(request.payload);
+        }
+        return false; // No response needed
+    }
+
+    if (request.type === "LOG_FAILURE") {
+        trackFailure(request.payload)
+            .then(() => sendResponse({ success: true }))
+            .catch(e => {
+                console.error('[BG] trackFailure error:', e);
+                sendResponse({ success: false, error: e.message });
+            });
+        return true; // Will respond asynchronously
+    } else if (request.type === "TRIGGER_SYNC") {
+        // Properly await sync and return actual result
+        // Previously called performAutoSync() without awaiting and immediately sent success: true
+        // Now we await the sync and return the actual result
+        performAutoSync()
+            .then(result => {
+                sendResponse({ success: true, data: result });
+            })
+            .catch(error => {
+                console.error('[BG] TRIGGER_SYNC failed:', error);
+                sendResponse({ success: false, error: error.message });
+            });
+        return true; // Will respond asynchronously
+    }
+    return false;
+});
+
+// trackFailure now writes to BOTH:
+//   'failures' (array, for Activity Log display)
+//   'syncFailures' (object platform→{uuid→count}, for retry logic reads)
+async function trackFailure(failure) {
+    const [{ failures = [] }, { syncFailures = {} }] = await Promise.all([
+        chrome.storage.local.get('failures'),
+        chrome.storage.local.get('syncFailures')
+    ]);
+
+    failures.push({ ...failure, timestamp: new Date().toISOString() });
+    if (failures.length > 100) failures.shift();
+
+    // Increment retry counter using platform-scoped key so performAutoSync retry
+    // logic can read syncFailures[platform] as a {uuid→count} map.
+    const MAX_FAILURES_PER_PLATFORM = 500;
+    if (failure.platform) {
+        if (typeof syncFailures[failure.platform] !== 'object' || syncFailures[failure.platform] === null) {
+            syncFailures[failure.platform] = {};
+        }
+        syncFailures[failure.platform][failure.uuid] = (syncFailures[failure.platform][failure.uuid] || 0) + 1;
+
+        // Prune platform failures to prevent unbounded growth
+        const platformEntries = Object.keys(syncFailures[failure.platform]);
+        if (platformEntries.length > MAX_FAILURES_PER_PLATFORM) {
+            // Keep entries with highest retry count (most likely to need tracking)
+            const sorted = Object.entries(syncFailures[failure.platform])
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, MAX_FAILURES_PER_PLATFORM);
+            syncFailures[failure.platform] = Object.fromEntries(sorted);
+        }
+    } else {
+        // No platform supplied — write under a dedicated '_unknown' namespace so we don't
+        // pollute the root with numeric UUID keys.  performAutoSync reads syncFailures[platform]
+        // as a {uuid→count} object; a root-level numeric key would pass the
+        // Object.values().every(v => typeof v === 'number') check and corrupt every platform's
+        // retry map.
+        if (!syncFailures['_unknown'] || typeof syncFailures['_unknown'] !== 'object') {
+            syncFailures['_unknown'] = {};
+        }
+        syncFailures['_unknown'][failure.uuid] = (syncFailures['_unknown'][failure.uuid] || 0) + 1;
+    }
+
+    await chrome.storage.local.set({ failures, syncFailures });
+}
+
+// ============================================
+// CONTEXT MENU CLICK HANDLER
+// ============================================
+
+// Context menu now actually triggers a download.
+// After extracting, send EXPORT_THREAD back to the content script which calls ExportManager.export().
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+    if (info.menuItemId === 'exportThread') {
+        chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_CONTENT' }, (response) => {
+            if (chrome.runtime.lastError) {
+                console.warn('[ContextMenu] Extract failed:', chrome.runtime.lastError.message);
+                return;
+            }
+            if (response && response.success) {
+                console.log('[ContextMenu] Extracted:', response.data.title, '— triggering download');
+                // Send the extracted data back to content script for download via ExportManager
+                chrome.tabs.sendMessage(tab.id, {
+                    type: 'EXPORT_THREAD',
+                    payload: { data: response.data, format: 'markdown' }
+                }, () => {
+                    if (chrome.runtime.lastError) {
+                        console.warn('[ContextMenu] Export message failed:', chrome.runtime.lastError.message);
+                    }
+                });
+            } else {
+                console.warn('[ContextMenu] Extract unsuccessful:', response?.error);
+            }
+        });
+    }
+});
+
+// ============================================
+// KEYBOARD SHORTCUTS (Commands)
+// ============================================
+chrome.commands.onCommand.addListener((command) => {
+    if (command === 'open_dashboard') {
+        chrome.tabs.create({ url: chrome.runtime.getURL('src/ui/options.html') });
+        Logger.info('System', 'Dashboard opened via keyboard shortcut');
+    }
+});
