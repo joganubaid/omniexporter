@@ -1,0 +1,2639 @@
+// OmniExporter — Options page / dashboard.
+"use strict";
+
+// ============================================================================
+// SECTION: STATE MANAGEMENT
+// ============================================================================
+let currentPlatform = "Unknown";
+let aiPlatformTabId = null;
+let selectedThreads = new Set();
+let threadData      = [];   // all threads shown so far (all pages accumulated)
+let currentPage     = 1;
+let itemsPerPage    = 50;
+let hasMoreThreads  = true;
+// Scoped to the currently-displayed platform. Union of:
+//   - this platform's {uuid → lastSyncedMs} map (kept in exportedUuidTimestamps)
+//   - the read-only pre-v2 legacy bucket (so existing users don't re-upload)
+// Reloaded whenever currentPlatform changes.
+let exportedUuids         = new Set();
+let exportedUuidTimestamps = new Map(); // current platform only, mutable
+let exportHistory   = [];
+let syncStatusMap   = {};
+let exportStartTime = null;
+
+// ── Prefetch buffer ───────────────────────────────────────────────────────────
+// Threads already fetched from the API but not yet shown to the user.
+// Allows platforms with small API caps (Perplexity: 20/req, ChatGPT: 28/req)
+// to still present full 50-item pages to the user.
+let prefetchBuffer = [];   // [{uuid, title, last_query_datetime, ...}]
+let apiOffset      = 0;    // tracks how far into the platform API we've read
+let apiHasMore     = true; // whether the API still has data beyond apiOffset
+// ─────────────────────────────────────────────────────────────────────────────
+
+// getPlatformUrl is provided by shared-utils.js (loaded before this file via
+// <script> in options.html). The canonical URL map lives in PlatformUrlBuilder
+// in shared-utils.js. Don't carry a local copy — this is the file where the
+// DeepSeek URL drift was caught (HAR-verified format is /a/chat/s/{id}, not
+// /c/{id}); centralising it here prevents the next round of drift.
+
+// ============================================================================
+// SECTION: PERFORMANCE & SECURITY UTILITIES (Phase 2)
+// ============================================================================
+
+/**
+ * Returns a debounced version of fn that delays invocation by ms milliseconds.
+ * @param {Function} fn - Function to debounce
+ * @param {number} ms - Delay in milliseconds (default 300)
+ * @returns {Function} Debounced function
+ */
+function debounce(fn, ms = 300) {
+    let timer;
+    return (...args) => {
+        clearTimeout(timer);
+        timer = setTimeout(() => fn(...args), ms);
+    };
+}
+
+// (LoadingManager, InputSanitizer, RequestDeduplicator, withRetry,
+//  NotionErrorMapper, RateLimiter are provided by shared-utils.js)
+
+const reqDeduplication = new RequestDeduplicator();
+
+const SCHEMA_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+// Notion Schema Cache
+let notionSchemaCache = null;
+let schemaCacheTime = 0;
+
+const notionRateLimiter = new RateLimiter(30);
+
+// ============================================================================
+// SECTION: FIX 17: EXPORT PROGRESS MANAGER
+// ============================================================================
+class ExportProgressManager {
+    static async saveProgress(jobId, progress) {
+        await chrome.storage.local.set({
+            [`export_progress_${jobId}`]: {
+                ...progress,
+                lastUpdate: Date.now()
+            }
+        });
+    }
+
+    static async loadProgress(jobId) {
+        const key = `export_progress_${jobId}`;
+        const data = await chrome.storage.local.get(key);
+        return data[key] || null;
+    }
+
+    static async clearProgress(jobId) {
+        await chrome.storage.local.remove(`export_progress_${jobId}`);
+    }
+
+    static async getActiveJob() {
+        const data = await chrome.storage.local.get(null);
+        for (const key of Object.keys(data)) {
+            if (key.startsWith('export_progress_')) {
+                const progress = data[key];
+                // Only return if less than 1 hour old and not complete
+                if (Date.now() - progress.lastUpdate < 60 * 60 * 1000 && progress.current < progress.total) {
+                    return { jobId: key.replace('export_progress_', ''), progress };
+                }
+            }
+        }
+        return null;
+    }
+}
+
+// ============================================================================
+// SECTION: DATA VALIDATOR
+// ============================================================================
+class DataValidator {
+    /**
+     * Validate thread data structure and completeness
+     */
+    static validateThreadData(data, platform) {
+        const errors = [];
+        const warnings = [];
+
+        // Basic structure validation
+        if (!data || typeof data !== 'object') {
+            errors.push('Invalid data structure');
+            return { valid: false, errors, warnings, completeness: 0, stats: {} };
+        }
+
+        // Title validation
+        if (!data.title || data.title.trim() === '' || data.title === 'Untitled') {
+            warnings.push('Thread has no meaningful title');
+        }
+
+        // UUID validation
+        if (!data.uuid) {
+            errors.push('Missing thread UUID');
+        }
+
+        // Content validation
+        const entries = data.detail?.entries || [];
+        if (entries.length === 0) {
+            errors.push('No conversation entries found');
+        }
+
+        let contentScore = 0;
+        let emptyEntries = 0;
+        let totalQuestions = 0;
+        let totalAnswers = 0;
+
+        entries.forEach((entry) => {
+            // Check for questions
+            const hasQuestion = !!(entry.query || entry.query_str);
+            if (hasQuestion) {
+                totalQuestions++;
+                contentScore += 10;
+            }
+
+            // Check for answers
+            let hasAnswer = false;
+            if (entry.blocks && Array.isArray(entry.blocks)) {
+                const hasTextBlock = entry.blocks.some(b =>
+                    b.intended_usage === 'ask_text' &&
+                    b.markdown_block &&
+                    (b.markdown_block.answer || b.markdown_block.chunks)
+                );
+                if (hasTextBlock) {
+                    hasAnswer = true;
+                    totalAnswers++;
+                    contentScore += 15;
+                }
+            }
+
+            if (!hasAnswer && (entry.answer || entry.text)) {
+                hasAnswer = true;
+                totalAnswers++;
+                contentScore += 15;
+            }
+
+            if (!hasAnswer) {
+                emptyEntries++;
+            }
+        });
+
+        // Calculate completeness score (0-100)
+        const maxScore = entries.length * 25;
+        const completeness = maxScore > 0 ? Math.round((contentScore / maxScore) * 100) : 0;
+
+        // Flag severely incomplete data
+        if (emptyEntries > entries.length * 0.5 && entries.length > 0) {
+            errors.push(`More than 50% of entries empty (${emptyEntries}/${entries.length})`);
+        }
+
+        // Platform-specific validation
+        if (platform === 'Perplexity') {
+            const hasSources = entries.some(entry =>
+                entry.blocks?.some(b =>
+                    b.intended_usage === 'web_results' &&
+                    b.web_result_block?.web_results?.length > 0
+                )
+            );
+            if (!hasSources && entries.length > 0) {
+                warnings.push('No sources found (unusual for Perplexity)');
+            }
+        }
+
+        return {
+            valid: errors.length === 0,
+            errors,
+            warnings,
+            completeness,
+            stats: {
+                totalEntries: entries.length,
+                emptyEntries,
+                totalQuestions,
+                totalAnswers,
+                hasUuid: !!data.uuid,
+                hasTitle: !!data.title && data.title !== 'Untitled'
+            }
+        };
+    }
+
+    /**
+     * Generate a detailed validation report
+     */
+    static generateReport(validation) {
+        const { valid, errors, warnings, completeness, stats } = validation;
+        let report = [];
+
+        if (valid) {
+            report.push(`✅ Validation passed (${completeness}% complete)`);
+        } else {
+            report.push(`❌ Validation failed`);
+        }
+
+        report.push(`📊 ${stats.totalQuestions} Q, ${stats.totalAnswers} A`);
+
+        if (errors.length > 0) {
+            report.push(`Errors: ${errors.join(', ')}`);
+        }
+
+        if (warnings.length > 0 && warnings.length <= 3) {
+            report.push(`Warnings: ${warnings.join(', ')}`);
+        } else if (warnings.length > 3) {
+            report.push(`${warnings.length} warnings`);
+        }
+
+        return report.join(' | ');
+    }
+
+    /**
+     * Check if data meets minimum quality threshold
+     */
+    static meetsMinimumQuality(validation, threshold = 50) {
+        return validation.valid && validation.completeness >= threshold;
+    }
+}
+
+// (ResilientDataExtractor class removed — was defined but never instantiated.
+// Per-platform answer/query/title extraction now happens in each adapter's
+// own getThreadDetail. Generic extraction utilities live in DataExtractor
+// in src/platform-config.js if needed.)
+
+// ============================================================================
+// SECTION: DUPLICATE DETECTOR
+// ============================================================================
+class DuplicateDetector {
+    /**
+     * Generate fingerprint for a thread
+     */
+    static generateFingerprint(data) {
+        const entries = data.detail?.entries || [];
+        const content = [
+            data.uuid,
+            data.title,
+            entries.length,
+            entries[0]?.query || entries[0]?.query_str || '',
+            entries[entries.length - 1]?.query || entries[entries.length - 1]?.query_str || ''
+        ].join('|');
+
+        return this.simpleHash(content);
+    }
+
+    /**
+     * Simple hash function
+     */
+    static simpleHash(str) {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash;
+        }
+        return hash.toString(36);
+    }
+
+    /**
+     * Check if thread has been modified since last export
+     */
+    static async hasChanged(uuid, newFingerprint) {
+        const { exportFingerprints = {} } = await chrome.storage.local.get('exportFingerprints');
+        const oldFingerprint = exportFingerprints[uuid];
+        return !oldFingerprint || oldFingerprint !== newFingerprint;
+    }
+
+    /**
+     * Save fingerprint after export — LRU-capped at 10K entries to prevent
+     * unbounded growth. When over cap, drops the oldest 1K entries. The map
+     * is iteration-ordered, so spread-then-slice preserves recency.
+     */
+    static async saveFingerprint(uuid, fingerprint) {
+        const { exportFingerprints = {} } = await chrome.storage.local.get('exportFingerprints');
+        // Delete-then-insert moves the key to the end (most-recent slot)
+        // even if it already existed.
+        delete exportFingerprints[uuid];
+        exportFingerprints[uuid] = fingerprint;
+        const MAX = 10000;
+        const TRIM_TO = 9000;
+        const keys = Object.keys(exportFingerprints);
+        if (keys.length > MAX) {
+            const dropCount = keys.length - TRIM_TO;
+            for (let i = 0; i < dropCount; i++) {
+                delete exportFingerprints[keys[i]];
+            }
+        }
+        await chrome.storage.local.set({ exportFingerprints });
+    }
+}
+
+// ============================================================================
+// SECTION: ERROR RECOVERY
+// ============================================================================
+class ErrorRecovery {
+    static async handleExportError(error) {
+        const errorType = this.classifyError(error);
+
+        switch (errorType) {
+            case 'RATE_LIMIT':
+                return { retry: true, delay: 60000, message: 'Rate limited. Waiting 60s...' };
+            case 'AUTH_ERROR':
+                return { retry: false, userAction: 'relogin', message: 'Please re-login to the platform' };
+            case 'NETWORK_ERROR':
+                if (!navigator.onLine) {
+                    return { retry: true, waitForOnline: true, message: 'Waiting for internet...' };
+                }
+                return { retry: true, delay: 5000, message: 'Network error. Retrying...' };
+            case 'DATA_ERROR':
+                return { retry: false, skip: true, message: 'Invalid data, skipping' };
+            default:
+                return { retry: false, message: error.message };
+        }
+    }
+
+    static classifyError(error) {
+        const message = (error.message || '').toLowerCase();
+
+        if (message.includes('rate') || message.includes('429')) return 'RATE_LIMIT';
+        if (message.includes('unauthorized') || message.includes('401')) return 'AUTH_ERROR';
+        if (message.includes('network') || message.includes('fetch')) return 'NETWORK_ERROR';
+        if (message.includes('validation') || message.includes('invalid')) return 'DATA_ERROR';
+
+        return 'UNKNOWN';
+    }
+}
+
+// ============================================================================
+// SECTION: CONTENT SCRIPT HEALTH CHECKER
+// ============================================================================
+// PLATFORM_CONTENT_SCRIPT_FILES and getContentScriptFiles() are defined in
+// src/utils/shared-utils.js (loaded before this script) to avoid duplication.
+
+class ContentScriptHealthChecker {
+    constructor() {
+        this.retryAttempts = 3;
+    }
+
+    /**
+     * Check if content script is responsive on a tab
+     */
+    async isContentScriptReady(tabId) {
+        return new Promise((resolve) => {
+            const timeout = setTimeout(() => {
+                resolve(false);
+            }, 2000);
+
+            chrome.tabs.sendMessage(tabId, { type: 'HEALTH_CHECK' }, (response) => {
+                clearTimeout(timeout);
+                if (chrome.runtime.lastError) {
+                    resolve(false);
+                } else {
+                    resolve(response?.healthy === true);
+                }
+            });
+        });
+    }
+
+    // (ensureContentScript + sendMessageWithHealthCheck removed — both were
+    // defined but never called externally. Popup has its own ensureContentScript
+    // implementation; auto-sync code path uses chrome.tabs.sendMessage with
+    // its own timeout/retry logic. If the dashboard ever needs proactive
+    // content-script injection, see src/ui/popup.js:ensureContentScript and
+    // src/utils/shared-utils.js:getContentScriptFiles for the canonical
+    // implementation.)
+
+    /**
+     * Test connection to a tab
+     */
+    async testConnection(tabId) {
+        const startTime = Date.now();
+
+        try {
+            const isReady = await this.isContentScriptReady(tabId);
+            return {
+                connected: isReady,
+                responseTime: Date.now() - startTime,
+                status: isReady ? 'healthy' : 'not_responsive'
+            };
+        } catch (error) {
+            return {
+                connected: false,
+                responseTime: Date.now() - startTime,
+                status: 'error',
+                error: error.message
+            };
+        }
+    }
+}
+
+// Global health checker instance
+const healthChecker = new ContentScriptHealthChecker();
+
+// ============================================================================
+// SECTION: AI PLATFORM TAB FINDER (Multi-Platform Support)
+// ============================================================================
+let allAITabs = []; // Store all found AI platform tabs
+
+async function findAllAIPlatformTabs() {
+    // Find ALL tabs with AI platform URLs
+    const supportedDomains = [
+        { domain: 'perplexity.ai', name: 'Perplexity' },
+        { domain: 'chatgpt.com', name: 'ChatGPT' },
+        { domain: 'chat.openai.com', name: 'ChatGPT' },
+        { domain: 'claude.ai', name: 'Claude' },
+        { domain: 'gemini.google.com', name: 'Gemini' },
+        { domain: 'grok.com', name: 'Grok' },
+        { domain: 'chat.deepseek.com', name: 'DeepSeek' }
+    ];
+
+    allAITabs = [];
+
+    for (const { domain, name } of supportedDomains) {
+        // Try with subdomain
+        const tabs = await chrome.tabs.query({ url: `*://*.${domain}/*` });
+        tabs.forEach(tab => {
+            if (!allAITabs.find(t => t.id === tab.id)) {
+                allAITabs.push({ ...tab, platformName: name });
+            }
+        });
+
+        // Also try without subdomain
+        const tabsAlt = await chrome.tabs.query({ url: `*://${domain}/*` });
+        tabsAlt.forEach(tab => {
+            if (!allAITabs.find(t => t.id === tab.id)) {
+                allAITabs.push({ ...tab, platformName: name });
+            }
+        });
+    }
+
+    return allAITabs;
+}
+
+async function updatePlatformSelector() {
+    const selector = document.getElementById('platformSelector');
+    if (!selector) return;
+
+    const tabs = await findAllAIPlatformTabs();
+    selector.innerHTML = '';
+
+    if (tabs.length === 0) {
+        selector.innerHTML = '<option value="">⚠️ No AI platforms found</option>';
+        log('Open Perplexity, ChatGPT, or Claude in another tab.', 'info');
+        return;
+    }
+
+    // Group tabs by platform
+    const groups = {};
+    tabs.forEach(tab => {
+        if (!groups[tab.platformName]) groups[tab.platformName] = [];
+        groups[tab.platformName].push(tab);
+    });
+
+    for (const [platform, platformTabs] of Object.entries(groups)) {
+        const optgroup = document.createElement('optgroup');
+        const emoji = platform === 'Perplexity' ? '🔮' :
+            platform === 'ChatGPT' ? '🤖' :
+                platform === 'Claude' ? '🧠' :
+                    platform === 'Gemini' ? '✨' :
+                        platform === 'Grok' ? '❌' :
+                            platform === 'DeepSeek' ? '🔍' : '💬';
+        optgroup.label = `${emoji} ${platform}`;
+
+        platformTabs.forEach(tab => {
+            const option = document.createElement('option');
+            option.value = tab.id;
+            const title = tab.title || 'Untitled Tab';
+            option.textContent = `${title.slice(0, 45)}${title.length > 45 ? '...' : ''}`;
+
+            if (tab.id === aiPlatformTabId) {
+                option.selected = true;
+                currentPlatform = platform;
+            }
+            optgroup.appendChild(option);
+        });
+        selector.appendChild(optgroup);
+    }
+
+    // If nothing selected yet, select the first available tab
+    if (!aiPlatformTabId && tabs.length > 0) {
+        aiPlatformTabId = tabs[0].id;
+        currentPlatform = tabs[0].platformName;
+        selector.value = aiPlatformTabId;
+    }
+
+    log(`Found ${tabs.length} AI platform tab(s)`, 'success');
+
+    // Update the visual platform icon
+    updatePlatformIcon();
+}
+
+function updatePlatformIcon() {
+    const iconDisplay = document.getElementById('platformIconDisplay');
+    if (!iconDisplay) return;
+    // Hide all icons first (new HTML uses .picon, old used .platform-icon — handle both)
+    iconDisplay.querySelectorAll('.picon, .platform-icon').forEach(icon => {
+        icon.style.display = 'none';
+    });
+    // Show the icon matching current platform
+    if (currentPlatform) {
+        const activeIcon = iconDisplay.querySelector(`[data-platform="${currentPlatform}"]`);
+        if (activeIcon) activeIcon.style.display = 'block';
+    }
+}
+
+async function getAITab() {
+    // CRITICAL FIX: Always return a tab matching the current platform
+    // This prevents exporting Grok threads from a Perplexity tab
+
+    const tabs = await findAllAIPlatformTabs();
+
+    // If we have a currentPlatform, find a tab for that specific platform
+    if (currentPlatform) {
+        const platformTab = tabs.find(t => t.platformName === currentPlatform);
+        if (platformTab) {
+            aiPlatformTabId = platformTab.id;
+            console.log(`[getAITab] Using ${currentPlatform} tab:`, platformTab.id);
+            return platformTab;
+        }
+    }
+
+    // Return cached tab if valid and still exists
+    if (aiPlatformTabId) {
+        try {
+            const tab = await chrome.tabs.get(aiPlatformTabId);
+            // Verify this tab is still in our AI tabs list
+            if (tab && tabs.find(t => t.id === tab.id)) {
+                return tabs.find(t => t.id === tab.id);
+            }
+        } catch (e) {
+            aiPlatformTabId = null;
+        }
+    }
+
+    // Otherwise find first available
+    if (tabs.length > 0) {
+        aiPlatformTabId = tabs[0].id;
+        return tabs[0];
+    }
+    return null;
+}
+
+// Message ID counter for tracking
+let messageIdCounter = 0;
+
+// Generate unique message ID
+function generateMessageId() {
+    return `msg_${Date.now()}_${++messageIdCounter}`;
+}
+
+// Send message with timeout (20 seconds, matching reference)
+async function sendMessageWithTimeout(tabId, message, timeoutMs = 20000) {
+    return new Promise((resolve, reject) => {
+        const msgId = generateMessageId();
+        const fullMessage = { ...message, id: msgId, timestamp: Date.now() };
+
+        // Set timeout
+        const timeoutId = setTimeout(() => {
+            reject(new Error(`Message timeout after ${timeoutMs / 1000}s`));
+        }, timeoutMs);
+
+        // Send message
+        chrome.tabs.sendMessage(tabId, fullMessage, (response) => {
+            clearTimeout(timeoutId);
+
+            if (chrome.runtime.lastError) {
+                reject(new Error(chrome.runtime.lastError.message));
+                return;
+            }
+
+            if (!response) {
+                reject(new Error('No response from content script'));
+                return;
+            }
+
+            if (!response.success) {
+                reject(new Error(response.error || 'Unknown error'));
+                return;
+            }
+
+            resolve(response);
+        });
+    });
+}
+
+// ============================================================================
+// SECTION: CONNECTION STATUS MONITORING
+// ============================================================================
+async function monitorConnectionStatus() {
+    try {
+        const statusEl = document.getElementById('connectionStatus');
+        if (!statusEl) return;
+
+        const tab = await getAITab();
+        if (!tab) {
+            statusEl.style.display = 'none';
+            return;
+        }
+
+        statusEl.style.display = 'flex';
+
+        const result = await healthChecker.testConnection(tab.id);
+
+        if (result.connected) {
+            statusEl.classList.add('connected');
+            statusEl.querySelector('.status-text').textContent = 'Connected';
+            const responseTimeEl = statusEl.querySelector('.response-time');
+            if (responseTimeEl) responseTimeEl.textContent = `${result.responseTime}ms`;
+        } else {
+            statusEl.classList.remove('connected');
+            statusEl.querySelector('.status-text').textContent = 'Disconnected';
+            const responseTimeEl = statusEl.querySelector('.response-time');
+            if (responseTimeEl) responseTimeEl.textContent = result.error || '';
+        }
+    } catch (e) {
+        // Silently ignore connection errors - this is expected when tabs close
+        // console.log('[Monitor] Connection check failed:', e.message);
+    }
+}
+// ============================================================================
+// SECTION: NOTION OAUTH HELPERS
+// ============================================================================
+function toggleNotionAuthSections(method) {
+    const oauthSection = document.getElementById('notionOauthSection');
+    const tokenSection = document.getElementById('notionTokenSection');
+    if (!oauthSection || !tokenSection) return;
+    if (method === 'token') {
+        oauthSection.style.display = 'none';
+        tokenSection.style.display = 'block';
+    } else {
+        oauthSection.style.display = 'block';
+        tokenSection.style.display = 'none';
+    }
+}
+
+function updateOauthStatus(data) {
+    const statusEl = document.getElementById('notionOauthStatus');
+    if (!statusEl) return;
+    const connected = !!data?.notion_oauth_workspace_name;
+    if (connected) {
+        statusEl.textContent = `Connected: ${data.notion_oauth_workspace_name}`;
+        statusEl.classList.add('connected');
+    } else {
+        statusEl.textContent = 'Not connected';
+        statusEl.classList.remove('connected');
+    }
+}
+
+async function resolveNotionToken() {
+    if (typeof NotionOAuth === 'undefined') {
+        throw new Error('OAuth module not loaded');
+    }
+    return NotionOAuth.getActiveToken();
+}
+
+async function handleOauthConnect() {
+    try {
+        // Capture whatever the user has typed in the DB ID field BEFORE the OAuth flow runs.
+        // If they've pre-filled their own database ID we must preserve it — the auto-create
+        // logic inside storeTokens() will only skip creation when a DB ID is already in
+        // storage, so we save it to storage first via saveAllSettings().
+        const dbIdInput = document.getElementById('notionDbId');
+        const userTypedDbId = dbIdInput ? dbIdInput.value.trim() : '';
+
+        await saveAllSettings();              // saves userTypedDbId to storage if valid
+        await NotionOAuth.init();
+        log('🔐 Starting OAuth flow...', 'info');
+        await NotionOAuth.authorize();        // → storeTokens() → createExportDatabase() only if no DB ID in storage
+        const status = await NotionOAuth.getStatus();
+        updateOauthStatus({ notion_oauth_workspace_name: status.workspace });
+        await chrome.storage.local.set({ notion_auth_method: 'oauth' });
+
+        // Storage flags are cleared inside NotionOAuth.storeTokens.
+        // Clear the user-visible badge/title set by background auto-sync.
+        chrome.action.setBadgeText({ text: '' });
+        chrome.action.setTitle({ title: 'OmniExporter' });
+
+        // Read what ended up in storage after the whole flow
+        const stored = await chrome.storage.local.get(['notionDbId', 'notionDbName']);
+
+        // If the user had pre-typed a DB ID and auto-create stored a different one,
+        // the user's explicit choice wins — overwrite storage and the input field.
+        if (userTypedDbId && InputSanitizer.validateDatabaseId(userTypedDbId) && stored.notionDbId !== userTypedDbId) {
+            await chrome.storage.local.set({ notionDbId: userTypedDbId });
+            if (dbIdInput) dbIdInput.value = userTypedDbId;
+            log(`✅ OAuth2 connected! Using your database: ${userTypedDbId}`, 'success');
+        } else if (stored.notionDbId) {
+            if (dbIdInput) dbIdInput.value = stored.notionDbId;
+            log(`✅ OAuth2 connected! Database "${stored.notionDbName || stored.notionDbId}" ready.`, 'success');
+        } else {
+            log('✅ OAuth2 connected. Paste your Database ID in the field above and click Save Settings.', 'success');
+        }
+    } catch (error) {
+        log(`OAuth connection failed: ${error.message}`, 'error');
+    }
+}
+
+async function handleOauthDisconnect() {
+    await NotionOAuth.disconnect();
+    await chrome.storage.local.set({ notion_auth_method: 'token' });
+    updateOauthStatus({});
+    log('OAuth disconnected', 'info');
+}
+
+// ============================================================================
+// SECTION: INITIALIZATION
+// ============================================================================
+document.addEventListener('DOMContentLoaded', async () => {
+    // Surface the manifest version in the sidebar + About tab so they always
+    // match the installed extension — no hardcoded version strings to drift.
+    const v = chrome.runtime.getManifest().version;
+    const brandEl = document.getElementById('brandVersion');
+    if (brandEl) brandEl.textContent = 'v' + v;
+    const aboutEl = document.getElementById('aboutVersion');
+    if (aboutEl) aboutEl.textContent = v;
+
+    initNavigation();
+    // initSubtabs removed — Activity/DevTools tabs deleted
+    initDataSourceRadio();
+    initDateFilter();
+
+    // Load persisted data
+    await loadSettings();
+    loadExportHistory();
+    loadFailures();
+
+    // Platform detection — must run before loadExportedUuids so the cache
+    // load picks the right per-platform key.
+    await updatePlatformSelector();
+    await loadExportedUuids();
+
+    // Only fetch history if we found a platform
+    if (aiPlatformTabId) {
+        fetchHistory(1);
+        loadSpaces();
+
+        // Check for interrupted jobs
+        const activeJob = await ExportProgressManager.getActiveJob();
+        if (activeJob) {
+            const resume = confirm(
+                `Found incomplete export: ${activeJob.progress.current}/${activeJob.progress.total} completed.\n\nResume?`
+            );
+            if (resume) {
+                selectedThreads = new Set(activeJob.progress.uuids.slice(activeJob.progress.current));
+                updateSelection(null, false);
+                setTimeout(() => bulkSyncToNotion(), 1000); // Resume after UI loads
+            } else {
+                await ExportProgressManager.clearProgress(activeJob.jobId);
+            }
+        }
+
+        // Start connection monitoring
+        monitorConnectionStatus();
+        const connectionMonitorInterval = setInterval(monitorConnectionStatus, 10000);
+
+        // Memory leak fix - cleanup interval on page unload
+        // Use both beforeunload and pagehide for maximum reliability
+        const cleanupInterval = () => {
+            if (connectionMonitorInterval) {
+                clearInterval(connectionMonitorInterval);
+            }
+        };
+        window.addEventListener('beforeunload', cleanupInterval);
+        window.addEventListener('pagehide', cleanupInterval);
+    } else {
+        log('Waiting for AI platform connection...', 'info');
+    }
+
+    // Event Listeners - Header
+    document.getElementById('autoSyncToggle')?.addEventListener('click', toggleAutoSync);
+
+    // OAuth UI events
+    document.querySelectorAll('input[name="notionAuthMethod"]').forEach((input) => {
+        input.addEventListener('change', (e) => {
+            toggleNotionAuthSections(e.target.value);
+        });
+    });
+
+    // Connect OAuth button
+    const connectBtn = document.getElementById('connectNotionOauth');
+    if (connectBtn) {
+        connectBtn.addEventListener('click', handleOauthConnect);
+    }
+
+    document.getElementById('disconnectNotionOauth')?.addEventListener('click', handleOauthDisconnect);
+
+    // Load NotionOAuth module
+    if (typeof NotionOAuth !== 'undefined') {
+        await NotionOAuth.init();
+    }
+
+
+    // Platform selector events
+    document.getElementById('platformSelector')?.addEventListener('change', async (e) => {
+        const selectedTabId = parseInt(e.target.value);
+        if (selectedTabId) {
+            aiPlatformTabId = selectedTabId;
+            const selectedTab = allAITabs.find(t => t.id === selectedTabId);
+            if (selectedTab) {
+                currentPlatform = selectedTab.platformName;
+                log(`Switched to ${currentPlatform}`, 'info');
+                updatePlatformIcon();
+                // Reload the dedup cache for the newly-selected platform so
+                // "already synced" badges reflect that platform's history.
+                await loadExportedUuids();
+                reqDeduplication.activeRequests.delete('fetchHistory');
+                fetchHistory(1);
+                loadSpaces();
+            }
+        }
+    });
+
+    document.getElementById('refreshPlatformsBtn')?.addEventListener('click', () => {
+        log('Refreshing platforms...', 'info');
+        updatePlatformSelector();
+    });
+
+    // Event Listeners - Thread List
+    document.getElementById('selectAllBtn')?.addEventListener('change', selectAllThreads);
+    document.getElementById('refreshHistory')?.addEventListener('click', () => fetchHistory(1));
+    document.getElementById('prevPageBtn')?.addEventListener('click', () => changePage(-1));
+    document.getElementById('nextPageBtn')?.addEventListener('click', () => changePage(1));
+    // loadAllBtn removed — pagination uses Prev/Next instead
+    document.getElementById('historySearch')?.addEventListener('input', debounce(handleSearch));
+
+    // Event Listeners - Bulk Actions
+    document.getElementById('bulkExportBtn')?.addEventListener('click', bulkSyncToNotion);
+    document.getElementById('bulkMdBtn')?.addEventListener('click', bulkExportMarkdown);
+    document.getElementById('exportAllBtn')?.addEventListener('click', exportAllThreads);
+    document.getElementById('clearCacheBtn')?.addEventListener('click', clearExportedCache);
+
+    // Event Listeners - Settings
+    document.getElementById('saveAllSettings')?.addEventListener('click', saveAllSettings);
+    document.getElementById('testNotionBtn')?.addEventListener('click', testNotionConnection);
+    // (Activity Log / Dev Tools tabs removed — listeners no-op via optional chaining)
+
+    // Offline Detection
+    window.addEventListener('online', () => log('🌐 Back online!', 'success'));
+    window.addEventListener('offline', () => log('🔌 Working offline. Some features may be limited.', 'error'));
+    if (!navigator.onLine) log('🔌 Working offline.', 'error');
+});
+
+
+// ============================================================================
+// SECTION: NAVIGATION
+// ============================================================================
+function initNavigation() {
+    document.querySelectorAll('.nav-item').forEach(item => {
+        item.addEventListener('click', () => {
+            const tabId = item.dataset.tab;
+
+            // Update nav items
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+            item.classList.add('active');
+
+            // Update tab content - hide all, then show selected
+            document.querySelectorAll('.tab').forEach(t => {
+                t.classList.add('hidden');
+                t.classList.remove('active');
+            });
+            const activeTab = document.getElementById(`tab-${tabId}`);
+            if (activeTab) {
+                activeTab.classList.remove('hidden');
+                activeTab.classList.add('active');
+            }
+            // Lazy-init the Logs tab the first time it's opened, and refresh
+            // the view every time the user clicks the tab.
+            if (tabId === 'logs') initLogsTab();
+        });
+    });
+}
+
+
+// ============================================================================
+// SECTION: DATA SOURCE & DATE FILTER
+// ============================================================================
+function initDataSourceRadio() {
+    document.querySelectorAll('input[name="dataSource"]').forEach(radio => {
+        radio.addEventListener('change', (e) => {
+            const spaceSelector = document.getElementById('spaceSelector');
+            if (!spaceSelector) return;
+            if (e.target.value === 'spaces') {
+                spaceSelector.classList.remove('hidden');
+            } else {
+                spaceSelector.classList.add('hidden');
+            }
+            fetchHistory(1);
+        });
+    });
+}
+
+function initDateFilter() {
+    const checkbox = document.getElementById('dateFilterEnabled');
+    const input = document.getElementById('dateFilterValue');
+
+    if (!checkbox || !input) return;
+
+    checkbox.addEventListener('change', () => {
+        input.disabled = !checkbox.checked;
+        if (!checkbox.checked) input.value = '';
+    });
+}
+
+// ============================================================================
+// SECTION: STORAGE & SETTINGS PERSISTENCE
+// ============================================================================
+async function loadSettings() {
+    const data = await chrome.storage.local.get([
+        'notionApiKey',
+        'notionKey',
+        'notionDbId',
+        'syncInterval',
+        'autoSyncNotion',
+        'includeMetadata',
+        'syncImages',
+        'syncCitations',
+        'skipExported',
+        'autoSyncEnabled',
+        'notion_auth_method',
+        'notion_oauth_client_id',
+        'notion_oauth_client_secret',
+        'notion_oauth_workspace_name',
+        'notion_oauth_token_expires'
+    ]);
+
+    // Migrate legacy key
+    if (!data.notionApiKey && data.notionKey) {
+        await chrome.storage.local.set({ notionApiKey: data.notionKey });
+    }
+
+    // Notion credentials
+    if (data.notionApiKey || data.notionKey) {
+        document.getElementById('notionKey').value = data.notionApiKey || data.notionKey;
+    }
+    if (data.notionDbId) {
+        document.getElementById('notionDbId').value = data.notionDbId;
+    }
+    // (Removed: load of notionOauthClientId/Secret/RedirectUri inputs that
+    // don't exist in the current options.html. OAuth client_id comes from
+    // config.js, the worker holds the secret, and chrome.identity supplies
+    // the redirect URI dynamically — no UI inputs needed.)
+
+
+    // Auth method (optional - simplified UI may not have this)
+    const authRadio = document.querySelector(`input[name="notionAuthMethod"]`);
+    if (authRadio) {
+        const authMethod = data.notion_auth_method || 'oauth';
+        const selectedRadio = document.querySelector(`input[name="notionAuthMethod"][value="${authMethod}"]`);
+        if (selectedRadio) selectedRadio.checked = true;
+    }
+    updateOauthStatus(data);
+
+    // Sync settings
+    if (data.syncInterval) {
+        document.getElementById('syncInterval').value = data.syncInterval;
+    }
+    if (data.autoSyncNotion) {
+        document.getElementById('autoSyncNotion').checked = true;
+    }
+    if (data.includeMetadata) {
+        document.getElementById('includeMetadata').checked = true;
+    }
+    if (data.syncImages !== false) { // Default true
+        document.getElementById('syncImages').checked = true;
+    }
+    if (data.syncCitations !== false) { // Default true
+        document.getElementById('syncCitations').checked = true;
+    }
+    if (data.skipExported !== false) { // Default true
+        document.getElementById('skipExported').checked = true;
+    }
+
+    // Auto-sync toggle in sidebar
+    if (data.autoSyncEnabled) {
+        const btn = document.getElementById('autoSyncToggle');
+        if (btn) btn.classList.add('active');
+        const lbl = document.getElementById('autoSyncLabel');
+        if (lbl) lbl.textContent = 'On';
+    }
+
+    log('Settings loaded from storage', 'info');
+}
+
+
+async function saveAllSettings() {
+    try {
+        const authMethod = document.querySelector('input[name="notionAuthMethod"]:checked')?.value || 'oauth';
+
+        // Helper to check element existence
+        const getVal = (id) => {
+            const el = document.getElementById(id);
+            return el ? InputSanitizer.clean(el.value.trim()) : '';
+        };
+
+        const settings = {
+            notionApiKey: getVal('notionKey'),
+            notionDbId: getVal('notionDbId'),
+            syncInterval: parseInt(document.getElementById('syncInterval')?.value) || 60,
+            autoSyncNotion: document.getElementById('autoSyncNotion')?.checked || false,
+            includeMetadata: document.getElementById('includeMetadata')?.checked || false,
+            syncImages: document.getElementById('syncImages')?.checked || false,
+            syncCitations: document.getElementById('syncCitations')?.checked || false,
+            skipExported: document.getElementById('skipExported')?.checked || false,
+            notion_auth_method: authMethod
+            // (Removed: notion_oauth_client_id/_secret — the inputs they read
+            // don't exist in options.html. Client ID is loaded from config.js;
+            // the secret lives on the Cloudflare Worker.)
+        };
+        // TODO: The autoSyncNotion / includeMetadata / syncImages /
+        // syncCitations / skipExported flags above are persisted to storage
+        // but no sync code currently consults them. Either wire them up in
+        // background.js performAutoSync + ExportManager (real feature work)
+        // or remove the checkboxes from options.html + drop these settings.
+
+        // Notion API key validation (only if token selected)
+        if (authMethod === 'token' && settings.notionApiKey && !settings.notionApiKey.startsWith('secret_') && !settings.notionApiKey.startsWith('ntn_')) {
+            log('⚠️ Invalid Notion API Key format. Should start with secret_ or ntn_', 'error');
+            return;
+        }
+
+        if (settings.notionDbId && !InputSanitizer.validateDatabaseId(settings.notionDbId)) {
+            log('⚠️ Invalid Notion Database ID format.', 'error');
+            return;
+        }
+
+        await chrome.storage.local.set(settings);
+        log('✅ All settings saved successfully!', 'success');
+
+        // Show confirmation
+        const btn = document.getElementById('saveAllSettings');
+        if (btn) {
+            const originalText = btn.innerHTML;
+            btn.innerHTML = '✅ Saved!';
+            btn.style.backgroundColor = 'var(--success)';
+            setTimeout(() => {
+                btn.innerHTML = originalText;
+                btn.style.backgroundColor = '';
+            }, 2000);
+        }
+    } catch (e) {
+        log(`Error saving settings: ${e.message}`, 'error');
+        throw e; // Re-throw to stop caller
+    }
+}
+
+
+// Test Notion API connection
+async function testNotionConnection() {
+    const resultEl = document.getElementById('notionTestResult');
+    const btnEl = document.getElementById('testNotionBtn');
+    const dbId = document.getElementById('notionDbId').value.trim();
+
+    if (!dbId) {
+        resultEl.innerHTML = '❌ Enter Database ID first';
+        resultEl.style.color = 'var(--error)';
+        return;
+    }
+
+    // Validate database ID format
+    if (!isValidNotionDatabaseId(dbId)) {
+        resultEl.innerHTML = '❌ Invalid Database ID format. Should be a 32-character ID.';
+        resultEl.style.color = 'var(--error)';
+        return;
+    }
+
+    btnEl.disabled = true;
+    btnEl.textContent = '⏳ Testing...';
+    resultEl.innerHTML = '';
+
+    try {
+        const token = await resolveNotionToken();
+        const response = await fetch(`https://api.notion.com/v1/databases/${dbId}`, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Notion-Version': '2022-06-28'
+            }
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            const dbTitle = data.title?.[0]?.plain_text || 'Database';
+            resultEl.innerHTML = `✅ Connected: "${escapeHtml(dbTitle)}"`;
+            resultEl.style.color = 'var(--success)';
+            log(`Notion connection successful: ${dbTitle}`, 'success');
+        } else {
+            const error = await response.json();
+            resultEl.innerHTML = `❌ ${escapeHtml(error.message || 'Connection failed')}`;
+            resultEl.style.color = 'var(--error)';
+            log(`Notion connection failed: ${error.message}`, 'error');
+        }
+    } catch (err) {
+        resultEl.innerHTML = `❌ ${escapeHtml(err.message)}`;
+        resultEl.style.color = 'var(--error)';
+        log(`Notion test error: ${err.message}`, 'error');
+    } finally {
+        btnEl.disabled = false;
+        btnEl.textContent = '🔌 Test Connection';
+    }
+}
+
+
+async function loadExportedUuids() {
+    // Always load the legacy bucket — checked alongside per-platform caches as
+    // a dedup fallback for pre-v2 UUIDs whose platform was unknown.
+    const legacy = await ExportedUuidStore.loadLegacy();
+
+    if (!currentPlatform || currentPlatform === 'Unknown') {
+        exportedUuids = legacy;
+        exportedUuidTimestamps = new Map();
+        return;
+    }
+    exportedUuidTimestamps = await ExportedUuidStore.load(currentPlatform);
+    exportedUuids = new Set([...exportedUuidTimestamps.keys(), ...legacy]);
+    log(`Loaded ${exportedUuidTimestamps.size} previously exported ${currentPlatform} thread(s)`, 'info');
+}
+
+async function saveExportedUuids() {
+    if (!currentPlatform || currentPlatform === 'Unknown') return;
+    await ExportedUuidStore.save(currentPlatform, exportedUuidTimestamps);
+}
+
+// (loadExportHistory removed here — canonical definition is at line ~2090
+// alongside renderExportHistory. JS function-hoisting meant the later
+// definition always won anyway; keeping it next to the renderer keeps both
+// concerns together.)
+
+function loadFailures() {
+    chrome.storage.local.get(['failures'], (data) => {
+        const container = document.getElementById('failureContent');
+        if (!container) return;
+
+        const failures = data.failures || [];
+        container.innerHTML = '';
+
+        if (failures.length === 0) {
+            container.innerHTML = '<div class="loader">No recent failures.</div>';
+            return;
+        }
+
+        failures.slice(0, 20).forEach(f => {
+            const item = document.createElement('div');
+            item.className = 'failure-card';
+            const time = f.timestamp ? new Date(f.timestamp).toLocaleString() : 'Unknown time';
+            item.innerHTML = `
+                <div class="failure-title">${escapeHtml(f.title || 'Unknown')}</div>
+                <div class="failure-meta">${escapeHtml(f.uuid?.slice(0, 8) || '')}... • ${escapeHtml(time)}</div>
+                <div class="failure-error">${escapeHtml(f.reason || 'Unknown error')}</div>
+                <button class="retry-btn" data-uuid="${escapeHtml(f.uuid)}">Retry</button>
+            `;
+            item.querySelector('.retry-btn')?.addEventListener('click', () => {
+                retryFailedThread(f.uuid);
+            });
+            container.appendChild(item);
+        });
+    });
+}
+
+
+function reportFailure(uuid, reason, title = 'Unknown') {
+    chrome.storage.local.get(['failures'], (data) => {
+        const failures = data.failures || [];
+        failures.unshift({
+            uuid,
+            reason,
+            title,
+            timestamp: new Date().toISOString()
+        });
+        // Keep last 50 failures
+        chrome.storage.local.set({
+            failures: failures.slice(0, 50)
+        }, () => {
+            loadFailures();
+        });
+    });
+}
+
+
+// Removed redundant detectPlatform function as it's replaced by updatePlatformSelector
+
+
+
+async function loadSpaces() {
+    try {
+        const tab = await getAITab();
+        if (!tab) return;
+
+        try {
+            const response = await sendMessageWithTimeout(tab.id, { type: 'GET_SPACES' }, 10000);
+            if (response.data && response.data.length > 0) {
+                const selector = document.getElementById('spaceSelector');
+                selector.innerHTML = '<option value="">Select a Space...</option>';
+                response.data.forEach(s => {
+                    const opt = document.createElement('option');
+                    opt.value = s.uuid;
+                    opt.textContent = s.name;
+                    selector.appendChild(opt);
+                });
+                selector.addEventListener('change', () => fetchHistory(1));
+            }
+        } catch (msgError) {
+            console.log('Could not load spaces:', msgError.message);
+        }
+    } catch (e) {
+        console.error("Load spaces error:", e);
+    }
+}
+
+
+// ============================================================================
+// SECTION: THREAD HISTORY — buffer-based pagination
+//
+// Design: platforms return different page sizes (Perplexity: 20, ChatGPT: 28,
+// Claude/Gemini: 50). We always show 50 items per page using a prefetchBuffer.
+//
+//  fillBuffer(target, tab, spaceId):
+//    Keeps calling GET_THREAD_LIST_OFFSET until the buffer holds ≥ target
+//    items OR the API has nothing more to give. Each call advances apiOffset
+//    by however many items the API returned (the platform's natural page size).
+//
+//  fetchHistory(page=1):
+//    Reset everything → fill buffer → slice 50 → render
+//
+//  changePage(+1):
+//    Fill buffer to 50 → slice 50 into threadData → render next page
+//
+//  changePage(-1):
+//    Slice from already-accumulated threadData (zero API calls)
+//
+// Indicator: "1–50 of 100+" when buffer still has data, "50–100 of 100" at end
+// ============================================================================
+
+async function fillBuffer(target, tab, spaceId) {
+    const FETCH_LIMIT = 50; // what we ask each call; platform may return less
+    while (prefetchBuffer.length < target && apiHasMore) {
+        let result;
+        try {
+            result = await new Promise((resolve) => {
+                chrome.tabs.sendMessage(tab.id, {
+                    type: 'GET_THREAD_LIST_OFFSET',
+                    payload: { offset: apiOffset, limit: FETCH_LIMIT, spaceId }
+                }, (resp) => {
+                    if (chrome.runtime.lastError || !resp?.success) {
+                        resolve({ success: false });
+                    } else {
+                        resolve(resp);
+                    }
+                });
+            });
+        } catch (e) {
+            break;
+        }
+
+        if (!result?.success || !result.data?.threads?.length) {
+            apiHasMore = false;
+            break;
+        }
+
+        const rawThreads = result.data.threads;
+        const seenAll    = new Set(threadData.map(t => t.uuid));
+        prefetchBuffer.push(...rawThreads.filter(t => !seenAll.has(t.uuid) &&
+            !prefetchBuffer.some(b => b.uuid === t.uuid)));
+
+        // Advance API offset by however many the platform actually returned
+        apiOffset += rawThreads.length;
+
+        // Trust the platform's hasMore signal
+        if (typeof result.data.hasMore === 'boolean') {
+            apiHasMore = result.data.hasMore;
+        } else {
+            apiHasMore = rawThreads.length >= FETCH_LIMIT;
+        }
+
+        await new Promise(r => setTimeout(r, 150)); // polite delay
+    }
+}
+
+async function fetchHistory(page = 1) {
+    const listEl    = document.getElementById('threadList');
+    const dataSource = document.querySelector('input[name="dataSource"]:checked')?.value || 'all';
+    const spaceId   = dataSource === 'spaces' ? document.getElementById('spaceSelector')?.value : null;
+    const dateFilterOn  = document.getElementById('dateFilterEnabled')?.checked;
+    const dateFilterVal = dateFilterOn ? document.getElementById('dateFilterValue')?.value : null;
+
+    // Show skeleton immediately
+    const skelRow = () => `<div class="skeleton-row"><div class="skel skel-check"></div><div class="skel skel-title"></div><div class="skel skel-date"></div></div>`;
+    listEl.innerHTML = skelRow().repeat(5);
+
+    if (page === 1) {
+        // Full reset
+        threadData     = [];
+        prefetchBuffer = [];
+        apiOffset      = 0;
+        apiHasMore     = true;
+        currentPage    = 1;
+        selectedThreads.clear();
+        updateSelection(null, false);
+    }
+
+    try {
+        await reqDeduplication.run('fetchHistory', async () => {
+            const tab = await getAITab();
+            if (!tab) {
+                listEl.innerHTML = `<div class="empty-state"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg><p>Open an AI platform tab first.</p></div>`;
+                hasMoreThreads = false;
+                updatePagination();
+                return;
+            }
+
+            // Fill buffer to at least one display page
+            await fillBuffer(itemsPerPage, tab, spaceId);
+
+            if (prefetchBuffer.length === 0 && threadData.length === 0) {
+                listEl.innerHTML = `<div class="empty-state"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg><p>No threads found.</p></div>`;
+                hasMoreThreads = false;
+                updatePagination();
+                return;
+            }
+
+            // Drain up to itemsPerPage from buffer into this page
+            let pageThreads = prefetchBuffer.splice(0, itemsPerPage);
+
+            // Apply date filter client-side
+            if (dateFilterVal) {
+                const filterDate = new Date(dateFilterVal);
+                pageThreads = pageThreads.filter(t =>
+                    t.last_query_datetime ? new Date(t.last_query_datetime) >= filterDate : true
+                );
+            }
+
+            threadData     = [...threadData, ...pageThreads];
+            currentPage    = page;
+            hasMoreThreads = apiHasMore || prefetchBuffer.length > 0;
+
+            const start = (currentPage - 1) * itemsPerPage;
+            renderThreadList(threadData.slice(start, start + itemsPerPage));
+            updatePagination();
+        });
+    } catch (e) {
+        console.error('[OmniExporter] fetchHistory error:', e);
+        listEl.innerHTML = `<div class="empty-state"><p>Error: ${escapeHtml(e.message)}</p></div>`;
+    }
+}
+
+async function changePage(delta) {
+    const newPage = currentPage + delta;
+    if (newPage < 1) return;
+
+    if (delta < 0) {
+        // Going backwards — data already in threadData, no API calls
+        currentPage = newPage;
+        const start = (currentPage - 1) * itemsPerPage;
+        renderThreadList(threadData.slice(start, start + itemsPerPage));
+        updatePagination();
+        return;
+    }
+
+    // Going forward
+    const neededStart = (newPage - 1) * itemsPerPage;
+    if (neededStart < threadData.length) {
+        // Already have this page in memory
+        currentPage = newPage;
+        renderThreadList(threadData.slice(neededStart, neededStart + itemsPerPage));
+        updatePagination();
+        return;
+    }
+
+    // Need to fetch more — run fetchHistory for the new page
+    await fetchHistory(newPage);
+}
+
+
+
+/**
+ * Compact relative time: "just now", "5m ago", "3h ago", "2d ago", "3w ago",
+ * or for anything older than ~30 days, the absolute month-day-year date.
+ * Used in the synced badge so users can see when each thread last reached Notion.
+ */
+function formatRelativeTime(ms) {
+    if (!ms || typeof ms !== 'number') return '';
+    const delta = Date.now() - ms;
+    if (delta < 0 || delta < 45_000) return 'just now';
+    const minutes = Math.round(delta / 60_000);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.round(delta / 3_600_000);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.round(delta / 86_400_000);
+    if (days < 7) return `${days}d ago`;
+    if (days < 30) return `${Math.round(days / 7)}w ago`;
+    return new Date(ms).toLocaleDateString(undefined, { year: '2-digit', month: 'short', day: 'numeric' });
+}
+
+function renderThreadList(threads) {
+    try {
+        const listEl = document.getElementById('threadList');
+        listEl.innerHTML = '';
+
+        if (threads.length === 0) {
+            listEl.innerHTML = `
+              <div class="empty-state">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+                <p>No threads found.</p>
+              </div>`;
+            return;
+        }
+
+        threads.forEach(t => {
+            try {
+                const isExported = exportedUuids.has(t.uuid);
+                const status     = syncStatusMap[t.uuid];
+                const isSelected = selectedThreads.has(t.uuid);
+                const item       = document.createElement('div');
+
+                item.className = `thread-item${isSelected ? ' selected' : ''}${isExported ? ' exported' : ''}`;
+                item.dataset.uuid = t.uuid;
+
+                // Format date: short locale date
+                const rawDate = t.last_query_datetime;
+                const dateStr = rawDate
+                    ? new Date(rawDate).toLocaleDateString(undefined, { year: '2-digit', month: 'short', day: 'numeric' })
+                    : '—';
+
+                const safeTitle = InputSanitizer.clean(t.title || 'Untitled');
+                const safeUuid  = InputSanitizer.clean(t.uuid);
+
+                // Synced badge with relative-time hint. Timestamp comes from
+                // exportedUuidTimestamps (per-platform store); for entries
+                // promoted from the pre-v2 legacy bucket the timestamp is the
+                // migration time, which we don't want to surface as "synced",
+                // so we omit the relative time when the entry came from legacy.
+                let syncedTag = '';
+                if (status === 'synced' || isExported) {
+                    const ts = exportedUuidTimestamps.get(t.uuid);
+                    const fromLegacy = !ts; // not in the per-platform map → must be legacy-only
+                    const relTime = ts ? formatRelativeTime(ts) : '';
+                    const fullTime = ts ? new Date(ts).toLocaleString() : 'unknown (synced before v5.5)';
+                    const tooltip = fromLegacy
+                        ? 'Synced (date unknown — pre-update history)'
+                        : `Synced ${relTime} (${fullTime})`;
+                    syncedTag = ` <span class="synced-badge" title="${InputSanitizer.clean(tooltip)}">✓${relTime ? ' ' + relTime : ''}</span>`;
+                } else if (status === 'failed') {
+                    syncedTag = ' <span class="failed-badge" title="Last sync failed">✗</span>';
+                }
+
+                item.innerHTML = `
+                    <div class="tcol-check">
+                        <input type="checkbox" data-uuid="${safeUuid}" ${isSelected ? 'checked' : ''} ${isExported ? 'disabled' : ''}>
+                    </div>
+                    <div class="tcol-title thread-title-cell">${safeTitle}${syncedTag}</div>
+                    <div class="tcol-date thread-date-cell">${dateStr}</div>
+                    <div class="tcol-action thread-action-cell">
+                        <button class="row-export-btn" data-uuid="${safeUuid}" title="Export this thread">
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                        </button>
+                    </div>
+                `;
+
+                if (!isExported) {
+                    const checkbox = item.querySelector('input[type="checkbox"]');
+                    checkbox.addEventListener('change', (e) => {
+                        const checked = e.target.checked;
+                        item.classList.toggle('selected', checked);
+                        updateSelection(t.uuid, checked);
+                    });
+                    item.addEventListener('click', (e) => {
+                        if (e.target === checkbox || e.target.closest('.row-export-btn')) return;
+                        const checked = !checkbox.checked;
+                        checkbox.checked = checked;
+                        item.classList.toggle('selected', checked);
+                        updateSelection(t.uuid, checked);
+                    });
+
+                    // Row-level quick export button
+                    item.querySelector('.row-export-btn')?.addEventListener('click', async (e) => {
+                        e.stopPropagation();
+                        const tab = await getAITab();
+                        if (!tab) return;
+                        chrome.tabs.sendMessage(tab.id, {
+                            type: 'EXTRACT_CONTENT_BY_UUID',
+                            payload: { uuid: t.uuid }
+                        }, (resp) => {
+                            if (resp?.success && typeof ExportManager !== 'undefined') {
+                                ExportManager.export(resp.data, 'markdown', resp.data.platform);
+                            }
+                        });
+                    });
+                }
+
+                listEl.appendChild(item);
+            } catch (itemError) {
+                console.error("[OmniExporter] Error rendering thread item:", itemError, t);
+            }
+        });
+    } catch (e) {
+        console.error("[OmniExporter] renderThreadList error:", e);
+        document.getElementById('threadList').innerHTML = '<div class="loader">Failed to render threads.</div>';
+    }
+}
+
+function updatePagination() {
+    const startItem = (currentPage - 1) * itemsPerPage + 1;
+    const endItem   = Math.min(currentPage * itemsPerPage, threadData.length);
+    const moreSign  = hasMoreThreads ? '+' : '';
+    const indicator = document.getElementById('pageIndicator');
+    if (indicator) {
+        indicator.textContent = threadData.length === 0
+            ? '—'
+            : `${startItem}–${endItem} of ${threadData.length}${moreSign}`;
+    }
+    const prevBtn = document.getElementById('prevPageBtn');
+    const nextBtn = document.getElementById('nextPageBtn');
+    if (prevBtn) prevBtn.disabled = currentPage === 1;
+    if (nextBtn) nextBtn.disabled = !hasMoreThreads && endItem >= threadData.length;
+}
+
+
+
+
+
+
+
+
+
+function handleSearch(e) {
+    const query = (e.target.value || '').toLowerCase().trim();
+    if (!query) {
+        // Empty search — show current page of unfiltered data
+        const start = (currentPage - 1) * itemsPerPage;
+        renderThreadList(threadData.slice(start, start + itemsPerPage));
+        return;
+    }
+    // Search across ALL fetched threadData, reset to page 1 of results
+    const filtered = threadData.filter(t => (t.title || '').toLowerCase().includes(query));
+    renderThreadList(filtered.slice(0, itemsPerPage));
+    const ind = document.getElementById('pageIndicator');
+    if (ind) ind.textContent = `${filtered.length} results`;
+}
+
+function selectAllThreads() {
+    const selectAllChk = document.getElementById('selectAllBtn');
+    const allChecked   = selectAllChk ? selectAllChk.checked : true;
+    const visible      = threadData.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage);
+    visible.forEach(t => {
+        if (!exportedUuids.has(t.uuid)) {
+            if (allChecked) selectedThreads.add(t.uuid);
+            else            selectedThreads.delete(t.uuid);
+        }
+    });
+    renderThreadList(visible);
+    updateSelection(null, false);
+}
+
+function updateSelection(uuid, checked) {
+    if (uuid) {
+        if (checked) selectedThreads.add(uuid);
+        else         selectedThreads.delete(uuid);
+    }
+    const count = selectedThreads.size;
+    const notionBtn = document.getElementById('bulkExportBtn');
+    const mdBtn     = document.getElementById('bulkMdBtn');
+    const countEl   = document.getElementById('bulkCount');
+    const mdCountEl = document.getElementById('bulkMdCount');
+    if (notionBtn) notionBtn.disabled = count === 0;
+    if (mdBtn)     mdBtn.disabled     = count === 0;
+    if (countEl)   countEl.textContent   = `(${count})`;
+    if (mdCountEl) mdCountEl.textContent = `(${count})`;
+}
+
+// ============================================================================
+// SECTION: EXPORT OPERATIONS
+// ============================================================================
+
+async function syncSingleThread(thread, forceReExport = false, retryCount = 0) {
+    // Use the shared RETRY_MAX_ATTEMPTS from shared-utils.js so retry count
+    // stays consistent across all retry sites.
+    const MAX_RETRIES = RETRY_MAX_ATTEMPTS;
+
+    syncStatusMap[thread.uuid] = 'syncing';
+
+    try {
+        const tab = await getAITab();
+        if (!tab) {
+            syncStatusMap[thread.uuid] = 'failed';
+            reportFailure(thread.uuid, 'No AI platform tab found', thread.title);
+            return;
+        }
+
+        try {
+            const response = await sendMessageWithTimeout(tab.id, {
+                type: 'EXTRACT_CONTENT_BY_UUID',
+                payload: { uuid: thread.uuid }
+            }, 30000);
+
+            // Validate data before syncing
+            const validation = DataValidator.validateThreadData(response.data, currentPlatform);
+            console.log('[OmniExporter] Validation:', DataValidator.generateReport(validation));
+
+            if (!validation.valid) {
+                syncStatusMap[thread.uuid] = 'failed';
+                reportFailure(thread.uuid, `Validation failed: ${validation.errors.join(', ')}`, thread.title);
+                return;
+            }
+
+            // Check for duplicates
+            const fingerprint = DuplicateDetector.generateFingerprint(response.data);
+            const hasChanged = await DuplicateDetector.hasChanged(thread.uuid, fingerprint);
+
+            if (!hasChanged && !forceReExport) {
+                syncStatusMap[thread.uuid] = 'skipped';
+                log(`Skipped ${thread.title}: No changes detected`, 'info');
+                return;
+            }
+
+            // Warn if low quality but still valid
+            if (validation.completeness < 50) {
+                log(`⚠️ ${thread.title}: Only ${validation.completeness}% complete`, 'warning');
+            }
+
+            await syncToNotion(response.data);
+
+            // Save fingerprint after successful sync
+            await DuplicateDetector.saveFingerprint(thread.uuid, fingerprint);
+
+            syncStatusMap[thread.uuid] = 'synced';
+            exportedUuidTimestamps.set(thread.uuid, Date.now());
+            exportedUuids.add(thread.uuid);
+            saveExportedUuids();
+
+        } catch (msgError) {
+            // Use ErrorRecovery for smart handling
+            const recovery = await ErrorRecovery.handleExportError(msgError);
+
+            // Check retry count before recursing
+            if (recovery.retry && recovery.delay && retryCount < MAX_RETRIES) {
+                log(`${recovery.message} (attempt ${retryCount + 1}/${MAX_RETRIES})`, 'warning');
+                await new Promise(r => setTimeout(r, recovery.delay));
+                return syncSingleThread(thread, forceReExport, retryCount + 1); // Retry with incremented count
+            }
+
+            syncStatusMap[thread.uuid] = 'failed';
+            const failureMsg = retryCount >= MAX_RETRIES
+                ? `Max retries (${MAX_RETRIES}) exceeded: ${recovery.message || msgError.message}`
+                : recovery.message || msgError.message;
+            reportFailure(thread.uuid, failureMsg, thread.title);
+        }
+    } catch (e) {
+        syncStatusMap[thread.uuid] = 'failed';
+        reportFailure(thread.uuid, e.message, thread.title);
+    }
+}
+
+async function exportSingleThread(thread) {
+    try {
+        const tab = await getAITab();
+        if (!tab) {
+            log('No AI platform tab found', 'error');
+            return;
+        }
+
+        try {
+            const response = await sendMessageWithTimeout(tab.id, {
+                type: 'EXTRACT_CONTENT_BY_UUID',
+                payload: { uuid: thread.uuid }
+            }, 30000);
+
+            // Fix: Ensure title is present (fallback to thread list title)
+            const title = response.data.title || thread.title || 'Untitled Chat';
+            response.data.title = title;
+
+            // Use shared ExportManager for consistent output and filename parsing
+            if (typeof ExportManager !== 'undefined') {
+                ExportManager.export(response.data, 'markdown', currentPlatform);
+            } else {
+                // Fallback to legacy validation if ExportManager is missing (should not happen)
+                const markdown = formatToMarkdown(response.data);
+                downloadFile(markdown, title);
+            }
+
+            log(`Exported: ${title}`, 'success');
+        } catch (msgError) {
+            log(`Export failed: ${msgError.message}`, 'error');
+        }
+    } catch (e) {
+        log(`Export error: ${e.message}`, 'error');
+    }
+}
+
+
+async function bulkSyncToNotion() {
+    try {
+        await reqDeduplication.run('bulkSync', async () => {
+            const uuids = Array.from(selectedThreads);
+            const total = uuids.length;
+            if (total === 0) return;
+
+            const progressContainer = document.getElementById('exportProgress');
+            const progressFill      = document.getElementById('progressBarFill');
+            const progressText      = document.getElementById('progressText');
+            const progressBatch     = document.getElementById('progressBatch');
+            const progressEta       = document.getElementById('progressEta');
+            const progressStats     = document.getElementById('progressStats');
+            const progressTitle     = document.getElementById('progressTitle');
+
+            // Per-batch sizing: 5 items per batch is a reasonable rate-limit
+            // bucket for Notion (~3 req/sec) — keeps the UI updating every
+            // ~4s during a long sync without overwhelming the API.
+            const BATCH_SIZE = 5;
+            const batchCount = Math.ceil(total / BATCH_SIZE);
+
+            progressContainer.classList.remove('hidden');
+            if (progressTitle) progressTitle.textContent = `Syncing to Notion · ${total} thread${total === 1 ? '' : 's'}`;
+            exportStartTime = Date.now();
+            let success = 0, failed = 0;
+
+            const jobId = `job_${Date.now()}`;
+            log(`Starting bulk sync of ${total} threads (${batchCount} batches of ${BATCH_SIZE})...`);
+
+            const updateProgress = (i) => {
+                const pct = Math.round((i / total) * 100);
+                progressFill.style.width = `${pct}%`;
+                progressText.textContent = `${i} / ${total}`;
+                const currentBatch = Math.min(batchCount, Math.floor(i / BATCH_SIZE) + 1);
+                if (progressBatch) progressBatch.textContent = `Batch ${currentBatch}/${batchCount}`;
+                if (progressStats) {
+                    progressStats.innerHTML = `
+                        <span class="stat-ok">✓ ${success}</span>
+                        ${failed > 0 ? `<span class="stat-fail">✗ ${failed}</span>` : ''}
+                    `;
+                }
+                // ETA = elapsed / processed × remaining
+                if (i > 0 && progressEta) {
+                    const elapsedMs = Date.now() - exportStartTime;
+                    const remainingMs = Math.round(elapsedMs / i * (total - i));
+                    progressEta.textContent = formatEta(remainingMs);
+                } else if (progressEta) {
+                    progressEta.textContent = '';
+                }
+            };
+
+            updateProgress(0);
+
+            for (let i = 0; i < total; i++) {
+                const thread = threadData.find(t => t.uuid === uuids[i]);
+                if (thread) {
+                    try {
+                        await syncSingleThread(thread);
+                        if (syncStatusMap[thread.uuid] === 'synced') success++;
+                        else failed++;
+                    } catch (e) {
+                        failed++;
+                    }
+
+                    // Save progress to storage every BATCH_SIZE items so the
+                    // user can resume an interrupted bulk sync from the
+                    // dashboard reload.
+                    if ((i + 1) % BATCH_SIZE === 0 || i === total - 1) {
+                        await ExportProgressManager.saveProgress(jobId, {
+                            current: i + 1, total, success, failed, uuids
+                        });
+                    }
+
+                    updateProgress(i + 1);
+
+                    // Rate-limit pacing between items (Notion ~3 req/sec).
+                    await new Promise(r => setTimeout(r, 800));
+                }
+            }
+
+            progressFill.style.width = '100%';
+            progressText.textContent = `${total} / ${total}`;
+            if (progressEta) progressEta.textContent = 'Done';
+            if (progressBatch) progressBatch.textContent = `Batch ${batchCount}/${batchCount}`;
+
+            await ExportProgressManager.clearProgress(jobId);
+            recordExportJob(total, success, failed);
+
+            setTimeout(() => {
+                progressContainer.classList.add('hidden');
+                selectedThreads.clear();
+                updateSelection(null, false);
+                renderThreadList(threadData.slice((currentPage - 1) * itemsPerPage, currentPage * itemsPerPage));
+            }, 2500);
+        });
+    } catch (e) {
+        console.error("[OmniExporter] Error boundary caught bulkSyncToNotion error:", e);
+        log('Bulk sync encountered an error. Progress may be saved for resume.', 'error');
+    }
+}
+
+/**
+ * Format milliseconds into "12s left" / "2m 30s left" / "Done".
+ */
+function formatEta(ms) {
+    if (!ms || ms < 0) return '';
+    if (ms < 5000) return 'almost done';
+    const totalSec = Math.round(ms / 1000);
+    if (totalSec < 60) return `~${totalSec}s left`;
+    const min = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    return `~${min}m ${sec}s left`;
+}
+
+// ============================================================================
+// SECTION: NOTION SYNC - Full API Integration
+// ============================================================================
+async function syncToNotion(data) {
+    // Load credentials from storage
+    const storage = await chrome.storage.local.get(['notionDbId']);
+    const dbId = storage.notionDbId;
+
+    if (!dbId) {
+        log('Notion not configured. Go to Settings to add API Key and Database ID.', 'error');
+        throw new Error('Notion not configured');
+    }
+
+    const apiKey = await resolveNotionToken();
+
+
+    try {
+        // Build content blocks from conversation entries
+        const entries = data.detail?.entries || [];
+        let children = [];
+
+        console.log('[OmniExporter] syncToNotion - entries:', entries.length);
+
+        // Use rich block builder if available, otherwise fall back to basic blocks
+        if (typeof NotionBlockBuilder !== 'undefined') {
+            children = NotionBlockBuilder.buildNotionBlocks(entries, currentPlatform || 'AI', {
+                title: data.title,
+                url: data.url || '',
+                model: data.detail?.model || '',
+                exportDate: new Date().toISOString().split('T')[0]
+            });
+        } else {
+            // Fallback: basic block generation
+            children.push({
+                type: "callout",
+                callout: {
+                    icon: { emoji: "🤖" },
+                    color: "blue_background",
+                    rich_text: [{
+                        type: "text",
+                        text: { content: `Exported from ${currentPlatform} on ${new Date().toLocaleString()}` }
+                    }]
+                }
+            });
+            children.push({ type: "divider", divider: {} });
+
+            entries.forEach((entry, index) => {
+                const query = entry.query || entry.query_str || '';
+                if (query) {
+                    children.push({
+                        type: "heading_2",
+                        heading_2: {
+                            rich_text: [{
+                                type: "text",
+                                text: { content: `🙋 ${query}`.slice(0, 2000) }
+                            }]
+                        }
+                    });
+                }
+
+                let answer = '';
+                let sources = [];
+
+                if (entry.blocks && Array.isArray(entry.blocks)) {
+                    entry.blocks.forEach(block => {
+                        if (block.markdown_block) {
+                            answer += (block.markdown_block.answer || block.markdown_block.chunks?.join('\n') || '') + '\n\n';
+                        }
+                        if (block.intended_usage === 'web_results' && block.web_result_block) {
+                            const webResults = block.web_result_block.web_results || [];
+                            webResults.forEach(wr => {
+                                if (wr.url && wr.name) {
+                                    sources.push({ name: wr.name, url: wr.url });
+                                }
+                            });
+                        }
+                    });
+                }
+
+                if (!answer.trim()) {
+                    answer = entry.answer || entry.text || '';
+                }
+
+                if (answer.trim()) {
+                    const chunks = splitTextForNotion(answer.trim(), 1900);
+                    chunks.forEach(chunk => {
+                        children.push({
+                            type: "paragraph",
+                            paragraph: {
+                                rich_text: [{
+                                    type: "text",
+                                    text: { content: chunk }
+                                }]
+                            }
+                        });
+                    });
+                }
+
+                if (sources.length > 0) {
+                    children.push({
+                        type: "heading_3",
+                        heading_3: {
+                            rich_text: [{
+                                type: "text",
+                                text: { content: "📚 Sources" }
+                            }]
+                        }
+                    });
+
+                    const uniqueSources = sources.filter((s, i, arr) => i === arr.findIndex(x => x.url === s.url));
+                    uniqueSources.slice(0, 10).forEach(source => {
+                        children.push({
+                            type: "bulleted_list_item",
+                            bulleted_list_item: {
+                                rich_text: [{
+                                    type: "text",
+                                    text: {
+                                        content: source.name.slice(0, 200),
+                                        link: { url: source.url }
+                                    }
+                                }]
+                            }
+                        });
+                    });
+                }
+
+                if (entry.related_queries && entry.related_queries.length > 0) {
+                    children.push({
+                        type: "heading_3",
+                        heading_3: {
+                            rich_text: [{
+                                type: "text",
+                                text: { content: "🔗 Related Questions" }
+                            }]
+                        }
+                    });
+
+                    entry.related_queries.slice(0, 5).forEach(q => {
+                        children.push({
+                            type: "bulleted_list_item",
+                            bulleted_list_item: {
+                                rich_text: [{
+                                    type: "text",
+                                    text: { content: q.slice(0, 200) }
+                                }]
+                            }
+                        });
+                    });
+                }
+
+                if (index < entries.length - 1) {
+                    children.push({ type: "divider", divider: {} });
+                }
+            });
+        }
+
+        // Create page in Notion database with dynamic properties and throttling
+        const properties = await buildNotionProperties(data, dbId, apiKey, entries);
+        const notionUrl = 'https://api.notion.com/v1/pages';
+
+        const response = await withRetry(async () => {
+            const res = await notionRateLimiter.throttle(async () => {
+                return await fetch(notionUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${apiKey}`,
+                        'Content-Type': 'application/json',
+                        'Notion-Version': '2022-06-28'
+                    },
+                    body: JSON.stringify({
+                        parent: { database_id: dbId },
+                        properties: properties,
+                        children: children.slice(0, 100)
+                    })
+                });
+            });
+            // Throw on rate-limit / service-unavailable so withRetry will back off and retry
+            if (res.status === 429 || res.status === 503) {
+                throw new Error(`Rate limited (${res.status})`);
+            }
+            return res;
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            console.error('[OmniExporter] Notion API error:', error);
+            throw new Error(NotionErrorMapper.map(error));
+        }
+
+        const result = await response.json();
+        const pageId = result.id;
+
+        // If content has more than 100 blocks, append remaining in chunks
+        if (children.length > 100) {
+            log(`📄 Appending ${children.length - 100} additional blocks...`, 'info');
+            await appendBlocksToPage(apiKey, pageId, children.slice(100));
+        }
+
+        log(`✅ Synced to Notion: ${data.title || 'Thread'}`, 'success');
+        console.log('[OmniExporter] Notion page created:', result.url);
+
+        return result;
+
+    } catch (err) {
+        log(`❌ Notion sync failed: ${err.message}`, 'error');
+        throw err;
+    }
+}
+
+// Append additional blocks to existing Notion page (handles >100 blocks)
+async function appendBlocksToPage(apiKey, pageId, blocks) {
+    // Chunk blocks into groups of 100
+    const chunks = [];
+    for (let i = 0; i < blocks.length; i += 100) {
+        chunks.push(blocks.slice(i, i + 100));
+    }
+
+    // Append each chunk
+    for (const chunk of chunks) {
+        const response = await notionRateLimiter.throttle(async () => {
+            return await fetch(`https://api.notion.com/v1/blocks/${pageId}/children`, {
+                method: 'PATCH',
+                headers: {
+                    'Authorization': `Bearer ${apiKey}`,
+                    'Content-Type': 'application/json',
+                    'Notion-Version': '2022-06-28'
+                },
+                body: JSON.stringify({ children: chunk })
+            });
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(`Failed to append blocks: ${error.message}`);
+        }
+
+        // Small delay to avoid rate limiting
+        await new Promise(r => setTimeout(r, 300));
+    }
+}
+
+
+// splitTextForNotion comes from shared-utils.js — local splitTextIntoChunks
+// was identical and has been removed (v5.5.0).
+
+async function bulkExportMarkdown() {
+    const uuids = Array.from(selectedThreads);
+
+    for (const uuid of uuids) {
+        const thread = threadData.find(t => t.uuid === uuid);
+        if (thread) await exportSingleThread(thread);
+    }
+    selectedThreads.clear();
+    updateSelection(null, false);
+}
+
+async function exportAllThreads() {
+    const uuids = threadData.filter(t => !exportedUuids.has(t.uuid)).map(t => t.uuid);
+    uuids.forEach(uuid => selectedThreads.add(uuid));
+    updateSelection(null, false);
+    await bulkSyncToNotion();
+}
+
+// ============================================================================
+// SECTION: EXPORT HISTORY TRACKING
+// ============================================================================
+function recordExportJob(total, success, failed, isAuto = false) {
+    const endTime = Date.now();
+    const duration = exportStartTime ? Math.round((endTime - exportStartTime) / 1000) : 0;
+
+    const job = {
+        timestamp: new Date().toISOString(),
+        total,
+        success,
+        failed,
+        duration,
+        isAuto,
+        platform: currentPlatform
+    };
+
+    chrome.storage.local.get(['exportHistory'], (data) => {
+        const history = data.exportHistory || [];
+        history.unshift(job);
+        // Keep only last 50 jobs
+        chrome.storage.local.set({ exportHistory: history.slice(0, 50) }, () => {
+            log(`Export completed: ${success}/${total} successful (${duration}s)`, success === total ? 'success' : 'error');
+            renderExportHistory();
+        });
+    });
+}
+
+function loadExportHistory() {
+    chrome.storage.local.get(['exportHistory'], (data) => {
+        exportHistory = data.exportHistory || [];
+        renderExportHistory();
+    });
+}
+
+function renderExportHistory() {
+    const container = document.getElementById('historyContent');
+    if (!container) return;
+
+    container.innerHTML = '';
+
+    if (exportHistory.length === 0) {
+        container.innerHTML = '<div class="loader">No export history yet.</div>';
+        return;
+    }
+
+    exportHistory.slice(0, 10).forEach(job => {
+        const item = document.createElement('div');
+        item.className = 'history-item';
+        const date = new Date(job.timestamp).toLocaleString();
+        const status = job.failed === 0 ? '✅' : '⚠️';
+        item.innerHTML = `
+            <div class="history-header">
+                <span>${status} ${job.success}/${job.total}</span>
+                <span class="history-meta">${date}</span>
+            </div>
+            <div class="history-details">
+            Duration: ${job.duration}s | Platform: ${job.platform || 'Unknown'}${job.isAuto ? ' | Auto-Sync' : ''}
+            </div>
+        `;
+        container.appendChild(item);
+    });
+}
+
+// ============================================================================
+// SECTION: UTILITIES
+// ============================================================================
+
+/**
+ * Fetches Notion database schema and caches it.
+ *
+ * TODO(v6): Duplicate of `getNotionDatabaseSchema` in popup.js (different
+ * implementation — this one uses `notionRateLimiter.throttle`, popup uses
+ * raw fetch). Consolidate into a single helper in shared-utils.js when one
+ * of them needs maintenance. Same goes for `formatToMarkdown`,
+ * `downloadFile`, `buildNotionProperties` below — all duplicated here vs
+ * popup.js with small behaviour drifts. See TODO note at the top of
+ * popup.js UTILITIES section.
+ */
+async function getNotionDatabaseSchema(dbId, apiKey) {
+    if (notionSchemaCache && (Date.now() - schemaCacheTime < SCHEMA_CACHE_TTL)) {
+        return notionSchemaCache;
+    }
+
+    try {
+        const response = await notionRateLimiter.throttle(async () => {
+            return await fetch(`https://api.notion.com/v1/databases/${dbId}`, {
+                headers: {
+                    'Authorization': `Bearer ${apiKey}`,
+                    'Notion-Version': '2022-06-28'
+                }
+            });
+        });
+
+        if (!response.ok) throw new Error('Database schema fetch failed');
+
+        const schema = await response.json();
+        notionSchemaCache = schema;
+        schemaCacheTime = Date.now();
+        return schema;
+    } catch (e) {
+        console.warn('[OmniExporter] Schema fetch failed:', e.message);
+        return null; // Fallback to title-only
+    }
+}
+
+/**
+ * Dynamically builds Notion properties based on available columns
+ */
+async function buildNotionProperties(data, dbId, apiKey, entries = []) {
+    // Bug 3 fix: key must be 'Title' (capital T) to match auto-created DB schema by notion-oauth.js
+    const properties = {
+        'Title': {
+            title: [{
+                type: "text",
+                text: { content: (data.title || 'Untitled Chat').slice(0, 2000) }
+            }]
+        }
+    };
+
+    try {
+        const schema = await getNotionDatabaseSchema(dbId, apiKey);
+        if (!schema || !schema.properties) return properties;
+
+        const availableProps = schema.properties;
+
+        // URL column — Bug 6 fix: use platform-aware URL instead of hardcoded Perplexity
+        if (availableProps['URL'] && data.uuid) {
+            properties.URL = { url: getPlatformUrl(currentPlatform, data.uuid) };
+        }
+
+        // Chat Time column
+        const threadTime = entries[0]?.updated_datetime || entries[0]?.created_datetime || data.datetime;
+        if (availableProps['Chat Time'] && threadTime) {
+            try {
+                properties['Chat Time'] = {
+                    date: { start: new Date(threadTime).toISOString() }
+                };
+            } catch (e) { /* Invalid date */ }
+        }
+
+        // Space Name column
+        if (availableProps['Space Name'] && data.spaceName) {
+            properties['Space Name'] = {
+                rich_text: [{ type: "text", text: { content: data.spaceName } }]
+            };
+        }
+
+        // Platform column
+        if (availableProps['Platform']) {
+            properties.Platform = {
+                select: { name: currentPlatform || 'Unknown' }
+            };
+        }
+
+        // Tags column (if it exists)
+        if (availableProps['Tags']) {
+            properties.Tags = {
+                multi_select: [{ name: currentPlatform || 'AI' }]
+            };
+        }
+
+    } catch (error) {
+        console.warn('[OmniExporter] Property build failed:', error.message);
+        if (typeof log === 'function') log('Using minimal properties due to schema fetch failure', 'info');
+    }
+
+    return properties;
+}
+
+// YAML value escaper for frontmatter
+function escapeYamlValue(value) {
+    if (!value) return '';
+    const str = String(value);
+    if (str.includes(':') || str.includes('#') || str.includes("'") || str.includes('"') || str.includes('\n')) {
+        return `"${str.replace(/"/g, '\\"')}"`;
+    }
+    return str;
+}
+
+// HTML escaper for XSS prevention
+function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = String(text);
+    return div.innerHTML;
+}
+
+// Validate Notion Database ID — delegates to InputSanitizer.validateDatabaseId
+// in shared-utils.js. Kept as a thin wrapper for backwards-compat with the
+// few call sites in this file that already use the local name.
+function isValidNotionDatabaseId(id) {
+    return InputSanitizer.validateDatabaseId(id);
+}
+
+// Log utility
+function log(message, type = 'info') {
+    const container = document.getElementById('logContent');
+    if (!container) {
+        console.log(`[${type}] ${message}`);
+        return;
+    }
+
+    const item = document.createElement('div');
+    item.className = `log-item log-${type}`;
+    const time = new Date().toLocaleTimeString();
+    item.innerHTML = `<span class="log-time">[${time}]</span> ${escapeHtml(message)}`;
+    container.insertBefore(item, container.firstChild);
+
+    while (container.children.length > 100) {
+        container.removeChild(container.lastChild);
+    }
+}
+
+// ============================================================================
+// SECTION: RESTORED STABILIZATION FUNCTIONS (Phase 2.5)
+// ============================================================================
+
+async function toggleAutoSync() {
+    const toggle = document.getElementById('autoSyncToggle');
+    const label  = document.getElementById('autoSyncLabel');
+    if (!toggle) return;
+    const isActive = toggle.classList.contains('active');
+
+    if (isActive) {
+        toggle.classList.remove('active');
+        if (label) label.textContent = 'Off';
+        chrome.alarms.clear('autoSyncAlarm');
+        chrome.storage.local.set({ autoSyncEnabled: false });
+        log('Auto-Sync disabled', 'info');
+    } else {
+        toggle.classList.add('active');
+        if (label) label.textContent = 'On';
+        const interval = parseInt(document.getElementById('syncInterval')?.value) || 60;
+        chrome.storage.local.set({ syncInterval: interval, autoSyncEnabled: true });
+        log(`Auto-Sync enabled (every ${interval} mins)`, 'success');
+    }
+}
+
+async function clearExportedCache() {
+    // Scoped to the currently-displayed platform plus an optional escape
+    // hatch for the pre-v2 legacy bucket. We never silently wipe all
+    // platforms — a user clearing ChatGPT shouldn't unprotect Claude.
+    if (!currentPlatform || currentPlatform === 'Unknown') {
+        log('No platform selected — pick a platform from the toolbar first.', 'error');
+        return;
+    }
+
+    const stats = await ExportedUuidStore.getStats();
+    const platformCount = stats.platforms[currentPlatform] || 0;
+    const legacyCount = stats.legacy;
+
+    if (platformCount === 0 && legacyCount === 0) {
+        log(`${currentPlatform} has no cached threads. Nothing to clear.`, 'info');
+        return;
+    }
+
+    // Build a confirmation message that reflects what's actually about to be
+    // cleared. The legacy bucket is shared across all platforms (it predates
+    // the per-platform split), so clearing it CAN cause re-uploads on other
+    // platforms too — we say so explicitly.
+    let confirmMsg = `Clear sync cache for ${currentPlatform} (${platformCount} thread${platformCount === 1 ? '' : 's'})?\n\n`;
+    confirmMsg += `Next sync will re-upload everything from ${currentPlatform} to Notion.`;
+    let clearLegacy = false;
+    if (legacyCount > 0) {
+        clearLegacy = confirm(
+            confirmMsg +
+            `\n\n— PLUS —\n\n` +
+            `${legacyCount} pre-update legacy thread${legacyCount === 1 ? '' : 's'} (shared across all platforms, no platform info available).\n\n` +
+            `Click OK to clear BOTH the per-${currentPlatform} cache AND the legacy bucket. ` +
+            `Other platforms may also see re-uploads of their pre-update history.\n\n` +
+            `Click Cancel to clear ONLY ${currentPlatform}'s per-platform cache.`
+        );
+    }
+    if (!clearLegacy && !confirm(confirmMsg)) return;
+
+    await ExportedUuidStore.clearPlatform(currentPlatform);
+    let msg = `Cleared ${currentPlatform} sync cache (${platformCount} entries).`;
+    if (clearLegacy) {
+        const removed = await ExportedUuidStore.forgetLegacy(
+            Object.keys((await chrome.storage.local.get(ExportedUuidStore.LEGACY_BUCKET))[ExportedUuidStore.LEGACY_BUCKET] || {})
+        );
+        msg += ` Also cleared ${removed} pre-update legacy entries.`;
+    }
+    await loadExportedUuids();
+    syncStatusMap = {};
+    log(msg, 'success');
+    const start = (currentPage - 1) * itemsPerPage;
+    renderThreadList(threadData.slice(start, start + itemsPerPage));
+}
+
+async function retryFailedThread(uuid) {
+    let thread = threadData.find(t => t.uuid === uuid);
+    if (!thread) {
+        // Thread not in the currently displayed page — search failures storage for metadata.
+        // (threadData only holds the most recently fetched page, so older failures can't be
+        // found here without this fallback.)
+        const data = await new Promise(r => chrome.storage.local.get('failures', r));
+        const failure = (data.failures || []).find(f => f.uuid === uuid);
+        if (failure) {
+            thread = { uuid: failure.uuid, title: failure.title || 'Unknown', platform: failure.platform };
+        }
+    }
+    if (thread) {
+        log(`Retrying: ${thread.title || uuid}`, 'info');
+        await syncSingleThread(thread);
+        if (typeof loadFailures === 'function') loadFailures();
+    } else {
+        log('Thread not found in history or failures list. Load All threads to retry older items.', 'error');
+    }
+}
+
+function formatToMarkdown(data) {
+    const entries = data.detail?.entries || [];
+    const firstEntry = entries[0] || {};
+
+    const title = escapeYamlValue(data.title || 'Untitled Chat');
+    const date = firstEntry.updated_datetime
+        ? new Date(firstEntry.updated_datetime).toISOString().split('T')[0]
+        : new Date().toISOString().split('T')[0];
+    const url = getPlatformUrl(currentPlatform, data.uuid) || '';
+
+    let md = '---\n';
+    md += `title: ${title}\n`;
+    md += `date: ${date}\n`;
+    md += `url: ${url}\n`;
+    md += `source: ${currentPlatform}\n`;
+    md += '---\n\n';
+
+    entries.forEach(entry => {
+        const query = entry.query || entry.query_str || '';
+        if (query) md += `## ${query}\n\n`;
+
+        let answer = '';
+        if (entry.blocks && Array.isArray(entry.blocks)) {
+            entry.blocks.forEach(block => {
+                if (block.markdown_block) {
+                    answer += (block.markdown_block.answer || block.markdown_block.chunks?.join('\n') || '') + '\n\n';
+                }
+            });
+        }
+        if (!answer.trim()) answer = entry.answer || entry.text || '';
+        if (answer.trim()) md += `${answer.trim()}\n\n`;
+
+        md += '---\n\n';
+    });
+
+    return md;
+}
+
+function downloadFile(content, name) {
+    const sanitized = name.replace(/[^a-z0-9]/gi, '_');
+    const blob = new Blob([content], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${sanitized}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
+// ============================================================================
+// SECTION: LOGS TAB — viewer for the Logger storage
+//
+// Talks directly to the globally-loaded Logger object. The tab is wired on
+// first open (lazy) and rebound on subsequent opens. Live-tail polls every
+// 2s when enabled; otherwise the user clicks Refresh.
+// ============================================================================
+const LogsTab = {
+    _bound: false,
+    _liveTailInterval: null,
+    _expandedId: null,
+
+    async init() {
+        const debugToggle    = document.getElementById('logsDebugToggle');
+        const levelSelect    = document.getElementById('logsLevel');
+        const moduleSelect   = document.getElementById('logsModule');
+        const searchInput    = document.getElementById('logsSearch');
+        const liveTailToggle = document.getElementById('logsLiveTail');
+        const refreshBtn     = document.getElementById('logsRefresh');
+        const exportBtn      = document.getElementById('logsExport');
+        const clearBtn       = document.getElementById('logsClear');
+        const privacyBanner  = document.getElementById('logsPrivacyBanner');
+
+        if (!this._bound && debugToggle) {
+            // Reflect current debug state + privacy banner.
+            const { debugMode } = await chrome.storage.local.get('debugMode');
+            debugToggle.checked = !!debugMode;
+            privacyBanner.classList.toggle('hidden', !debugMode);
+
+            debugToggle.addEventListener('change', async (e) => {
+                await Logger.updateSettings({ debugMode: e.target.checked });
+                privacyBanner.classList.toggle('hidden', !e.target.checked);
+                log(e.target.checked
+                    ? '🟢 Developer mode ON — all log levels stored with full payloads.'
+                    : '⚫ Developer mode OFF — only errors stored, payloads stripped. Existing logs cleared.',
+                    'info');
+                this.render();
+            });
+
+            // Populate module list from Logger.MODULES
+            for (const mod of Object.keys(Logger.MODULES)) {
+                const opt = document.createElement('option');
+                opt.value = mod;
+                opt.textContent = `${Logger.MODULES[mod].icon} ${mod}`;
+                moduleSelect.appendChild(opt);
+            }
+
+            [levelSelect, moduleSelect].forEach(el =>
+                el.addEventListener('change', () => this.render()));
+            searchInput.addEventListener('input', debounce(() => this.render(), 250));
+            refreshBtn.addEventListener('click', () => this.render());
+            exportBtn.addEventListener('click', () => this.exportNDJSON());
+            clearBtn.addEventListener('click', () => this.clearLogs());
+            liveTailToggle.addEventListener('change', e => this.setLiveTail(e.target.checked));
+
+            this._bound = true;
+        }
+
+        await this.render();
+    },
+
+    setLiveTail(on) {
+        if (this._liveTailInterval) {
+            clearInterval(this._liveTailInterval);
+            this._liveTailInterval = null;
+        }
+        if (on) {
+            this._liveTailInterval = setInterval(() => this.render(), 2000);
+        }
+    },
+
+    async render() {
+        const level   = document.getElementById('logsLevel')?.value || '';
+        const module  = document.getElementById('logsModule')?.value || '';
+        const search  = document.getElementById('logsSearch')?.value || '';
+        const listEl  = document.getElementById('logsList');
+        if (!listEl) return;
+
+        const filter = {};
+        if (level)  filter.level = level;
+        if (module) filter.module = module;
+        if (search) filter.search = search;
+        filter.limit = 500; // Cap rendering at 500 most-recent entries.
+
+        const logs = await Logger.getLogs(filter);
+        const perf = await Logger.getPerformanceSummary(50);
+        this.renderPerfCard(perf);
+
+        if (logs.length === 0) {
+            listEl.innerHTML = `
+                <div class="empty-state">
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                    <p>No log entries match the current filter. Toggle developer mode and trigger an export to see traces.</p>
+                </div>`;
+            return;
+        }
+
+        // Render most-recent-first.
+        const reversed = [...logs].reverse();
+        listEl.innerHTML = reversed.map(entry => this.renderRow(entry)).join('');
+
+        // Wire trace-id click → filter by that trace
+        listEl.querySelectorAll('.log-row-trace').forEach(el => {
+            el.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const tid = el.dataset.traceId;
+                const searchInput = document.getElementById('logsSearch');
+                if (searchInput && tid) {
+                    searchInput.value = tid;
+                    this.render();
+                }
+            });
+        });
+
+        // Wire row click → expand/collapse data panel
+        listEl.querySelectorAll('.log-row').forEach(row => {
+            row.addEventListener('click', () => {
+                const id = row.dataset.id;
+                this._expandedId = this._expandedId === id ? null : id;
+                this.render();
+            });
+        });
+    },
+
+    renderRow(entry) {
+        const t = entry.timestamp ? entry.timestamp.split('T')[1]?.split('.')[0] || '' : '';
+        const traceShort = entry.traceId ? entry.traceId.split('-').slice(-2).join('-') : '';
+        const traceBadge = entry.traceId
+            ? `<span class="log-row-trace" data-trace-id="${escapeHtml(entry.traceId)}" title="Click to filter by trace ${escapeHtml(entry.traceId)}">⛓ ${escapeHtml(traceShort)}</span>`
+            : '';
+        const expanded = this._expandedId === entry.id;
+        const detail = expanded
+            ? `<div class="log-row-detail">${escapeHtml(JSON.stringify(entry.data || (entry._privacy || {}), null, 2))}${entry.stack ? '\n\nSTACK:\n' + escapeHtml(entry.stack) : ''}</div>`
+            : '';
+        return `
+            <div class="log-row" data-id="${escapeHtml(entry.id)}">
+                <div class="log-row-time">${t}</div>
+                <div class="log-row-level ${entry.level}">${entry.level}</div>
+                <div class="log-row-module">${entry.moduleIcon || ''} ${escapeHtml(entry.module)}</div>
+                <div class="log-row-msg">${escapeHtml(entry.message)}${traceBadge}</div>
+                ${detail}
+            </div>`;
+    },
+
+    renderPerfCard(perf) {
+        const setText = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
+        setText('logsPerfCount', perf.count ? String(perf.count) : '—');
+        setText('logsPerfAvg', perf.count ? `${perf.avgMs}ms` : '—');
+        setText('logsPerfP95', perf.count ? `${perf.p95Ms}ms` : '—');
+        if (perf.slowest) {
+            setText('logsPerfSlowest', `${perf.slowest.data.durationMs}ms · ${perf.slowest.module}: ${perf.slowest.message}`);
+        } else {
+            setText('logsPerfSlowest', '—');
+        }
+    },
+
+    async exportNDJSON() {
+        const { content, filename, mimeType } = await Logger.exportLogs('ndjson');
+        const blob = new Blob([content], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(url);
+        log(`Exported ${filename}`, 'success');
+    },
+
+    async clearLogs() {
+        if (!confirm('Clear all stored logs? This cannot be undone.')) return;
+        await Logger.clear();
+        this.render();
+        log('Logs cleared.', 'success');
+    }
+};
+
+async function initLogsTab() {
+    if (typeof Logger === 'undefined') return;
+    await LogsTab.init();
+}
