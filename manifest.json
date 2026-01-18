@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "OmniExporter",
-    "version": "4.2.0",
+    "version": "5.0.0",
     "description": "Export conversations from Perplexity, ChatGPT, Claude, Gemini, Grok & DeepSeek to Markdown, JSON & Notion. Includes a dashboard with bulk actions, auto-sync, and Notion OAuth2.",
     "commands": {
         "_execute_action": {
