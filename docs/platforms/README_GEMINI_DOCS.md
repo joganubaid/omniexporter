@@ -277,9 +277,9 @@ cat AGENT_VALIDATION_GUIDE.md
 ## 🙏 Acknowledgments
 
 - **HAR Capture:** Firefox 147.0.4
-- **Analysis Date:** 2026-02-21
-- **Analyst:** Kiro AI Assistant
-- **Extension Version:** 5.5.0
+- **Analysis Date:** 2025-11-10
+- **Analyst:** Mohammed saddik
+- **Extension Version:** 4.2.0
 
 ---
 
