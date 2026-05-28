@@ -134,12 +134,6 @@ Bug reports and pull requests are welcome. Have a look at
 a new platform integration needs. Security issues are handled separately,
 see [SECURITY.md](SECURITY.md).
 
-## Authors
-
-Built and maintained by [joganubaid](https://github.com/joganubaid) and
-[Mohammed saddik](https://github.com/Mohammedsaddik4689). Both worked across
-every layer of the codebase.
-
 ## License
 
 [MIT](LICENSE)
