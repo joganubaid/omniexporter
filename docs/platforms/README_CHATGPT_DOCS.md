@@ -85,7 +85,7 @@ Total API Endpoints: 37 unique
 Critical Endpoints: 2 (for export)
 Network Requests: 150+
 Capture Duration: ~30 minutes
-Analysis Date: February 21, 2026
+Analysis Date: February 5, 2026
 ```
 
 ---
