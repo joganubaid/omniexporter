@@ -39,7 +39,7 @@ root.ExportManager = class ExportManager {
         return /\.(png|jpe?g|gif|webp|bmp|svg|avif)(\?|#|$)/i.test(url);
     }
 
-    static export(data, format = 'markdown', platform = 'Unknown') {
+    static export(data, format = 'markdown', platform = 'Unknown', options = {}) {
         const formatConfig = this.formats[format];
         if (!formatConfig) {
             if (typeof Logger !== 'undefined') Logger.error('Export', 'Unsupported format', { format });
@@ -51,13 +51,13 @@ root.ExportManager = class ExportManager {
         let content;
         switch (format) {
             case 'markdown':
-                content = this.toMarkdown(data, platform);
+                content = this.toMarkdown(data, platform, options);
                 break;
             case 'json':
-                content = this.toJSON(data, platform);
+                content = this.toJSON(data, platform, options);
                 break;
             default:
-                content = this.toMarkdown(data, platform);
+                content = this.toMarkdown(data, platform, options);
         }
 
         const filename = this.generateFilename(data.title || 'Chat', formatConfig.extension);
@@ -70,7 +70,11 @@ root.ExportManager = class ExportManager {
     // ============================================
     // MARKDOWN EXPORT — Linear narrative format
     // ============================================
-    static toMarkdown(data, platform) {
+    static toMarkdown(data, platform, options = {}) {
+        const includeMetadata = options.includeMetadata !== false;
+        const syncCitations = options.syncCitations !== false;
+        const syncImages = options.syncImages !== false;
+
         const entries = data.detail?.entries || [];
         const title = data.title || 'Untitled Chat';
         const firstEntry = entries[0] || {};
@@ -85,23 +89,27 @@ root.ExportManager = class ExportManager {
         const totalAttachments = allMeta.reduce((sum, m) => sum + m.attachments.length, 0);
         const totalMedia = allMeta.reduce((sum, m) => sum + m.media.length, 0);
 
-        let md = '---\n';
-        md += `title: ${this._yamlString(title)}\n`;
-        md += `date: ${date}\n`;
-        md += `platform: ${this._yamlString(platform)}\n`;
-        md += `uuid: ${this._yamlString(data.uuid || 'unknown')}\n`;
-        md += `entries: ${entries.length}\n`;
-        if (model) md += `model: ${this._yamlString(model)}\n`;
-        if (totalSources > 0) md += `sources: ${totalSources}\n`;
-        if (totalAttachments > 0) md += `attachments: ${totalAttachments}\n`;
-        if (totalMedia > 0) md += `media: ${totalMedia}\n`;
-        md += `tags: [chat, ${platform.toLowerCase()}]\n`;
-        md += '---\n\n';
+        let md = '';
+        if (includeMetadata) {
+            md += '---\n';
+            md += `title: ${this._yamlString(title)}\n`;
+            md += `date: ${date}\n`;
+            md += `platform: ${this._yamlString(platform)}\n`;
+            md += `uuid: ${this._yamlString(data.uuid || 'unknown')}\n`;
+            md += `entries: ${entries.length}\n`;
+            if (model) md += `model: ${this._yamlString(model)}\n`;
+            if (syncCitations && totalSources > 0) md += `sources: ${totalSources}\n`;
+            if (totalAttachments > 0) md += `attachments: ${totalAttachments}\n`;
+            if (syncImages && totalMedia > 0) md += `media: ${totalMedia}\n`;
+            md += `tags: [chat, ${platform.toLowerCase()}]\n`;
+            md += '---\n\n';
+        }
         md += `# ${title}\n\n`;
-        md += `**Platform:** ${platform} | **Conversations:** ${entries.length} | **Date:** ${date}\n`;
-        if (model) md += `**Model:** ${model}\n`;
-        md += '\n';
-
+        if (includeMetadata) {
+            md += `**Platform:** ${platform} | **Conversations:** ${entries.length} | **Date:** ${date}\n`;
+            if (model) md += `**Model:** ${model}\n`;
+            md += '\n';
+        }
         entries.forEach((entry, index) => {
             const query = entry.query || entry.query_str || '';
             const meta = entries.length === allMeta.length ? allMeta[index] : this._extractEntryMeta(entry);
@@ -127,8 +135,11 @@ root.ExportManager = class ExportManager {
                         const safeUrl = this._sanitizeUrl(url);
 
                         if (safeUrl && this._looksLikeImageUrl(safeUrl)) {
-                            md += `![${name}](${safeUrl})\n\n`;
-                        } else if (att.extracted_content) {
+                            if (syncImages) {
+                                md += `![${name}](${safeUrl})\n\n`;
+                            } else {
+                                md += `> *Image attachment: [${name}](${safeUrl})*\n\n`;
+                            }
                             // Use ~~~ fence when content already contains ``` to avoid breaking out
                             const fence = att.extracted_content.includes('```') ? '~~~' : '```';
                             md += `<details>\n<summary><strong>Attachment: ${name}</strong> (${att.extracted_content.length} chars)</summary>\n\n`;
@@ -188,7 +199,7 @@ root.ExportManager = class ExportManager {
                 }
 
                 // Citations (from Claude API)
-                if (entry.citations && entry.citations.length > 0) {
+                if (syncCitations && entry.citations && entry.citations.length > 0) {
                     md += '**Citations:**\n\n';
                     const seen = {};
                     entry.citations.forEach(c => {
@@ -202,7 +213,7 @@ root.ExportManager = class ExportManager {
             }
 
             // Sources (from blocks or entry-level, not already shown as citations)
-            if (meta.sources.length > 0) {
+            if (syncCitations && meta.sources.length > 0) {
                 md += '**Sources:**\n\n';
                 const seen = {};
                 meta.sources.forEach((source, i) => {
@@ -226,7 +237,7 @@ root.ExportManager = class ExportManager {
             }
 
             // Media items
-            if (meta.media.length > 0) {
+            if (syncImages && meta.media.length > 0) {
                 md += '**Media:**\n\n';
                 meta.media.forEach(m => {
                     const safeUrl = this._sanitizeUrl(m.url);
@@ -234,7 +245,6 @@ root.ExportManager = class ExportManager {
                 });
                 md += '\n';
             }
-
             // Related questions
             if (meta.relatedQuestions.length > 0) {
                 md += '**Related Questions:**\n\n';
@@ -245,21 +255,21 @@ root.ExportManager = class ExportManager {
             }
         });
 
-        md += `---\n\n*Exported with OmniExporter on ${new Date().toISOString()}*\n`;
+        if (includeMetadata) {
+            md += `---\n\n*Exported with OmniExporter on ${new Date().toISOString()}*\n`;
+        }
         return md;
     }
 
     // ============================================
     // JSON FORMAT
     // ============================================
-    static toJSON(data, platform) {
+    static toJSON(data, platform, options = {}) {
+        const includeMetadata = options.includeMetadata !== false;
+        const syncCitations = options.syncCitations !== false;
+        const syncImages = options.syncImages !== false;
+
         const exportData = {
-            meta: {
-                exportedAt: new Date().toISOString(),
-                platform: platform,
-                version: (typeof chrome !== 'undefined' && chrome.runtime?.getManifest?.()?.version) || 'unknown',
-                tool: 'OmniExporter'
-            },
             conversation: {
                 uuid: data.uuid || null,
                 title: data.title || 'Untitled Chat',
@@ -283,23 +293,40 @@ root.ExportManager = class ExportManager {
                     turn: index + 1,
                     query: entry.query || entry.query_str || '',
                     blocks,
-                    answer,
-                    sources: entryMeta.sources,
-                    citations: entry.citations || [],
-                    metadata: {
+                    answer
+                };
+                if (syncCitations) {
+                    result.sources = entryMeta.sources;
+                    result.citations = entry.citations || [];
+                }
+                if (includeMetadata) {
+                    result.metadata = {
                         createdAt: entry.created_datetime || null,
                         updatedAt: entry.updated_datetime || null,
                         model: entry.display_model || entry.model || null
-                    }
-                };
+                    };
+                }
                 if (entry.artifactIds && entry.artifactIds.length > 0) result.artifactIds = entry.artifactIds;
-                if (entryMeta.attachments.length > 0) result.attachments = entryMeta.attachments;
-                if (entryMeta.media.length > 0) result.media = entryMeta.media;
+                if (entryMeta.attachments.length > 0) {
+                    result.attachments = syncImages
+                        ? entryMeta.attachments
+                        : entryMeta.attachments.filter(att => !this._looksLikeImageUrl(att.url || att.fileUrl || ''));
+                }
+                if (syncImages && entryMeta.media.length > 0) result.media = entryMeta.media;
                 if (entryMeta.knowledgeCards.length > 0) result.knowledgeCards = entryMeta.knowledgeCards;
                 if (entryMeta.relatedQuestions.length > 0) result.relatedQuestions = entryMeta.relatedQuestions;
                 return result;
             })
         };
+
+        if (includeMetadata) {
+            exportData.meta = {
+                exportedAt: new Date().toISOString(),
+                platform: platform,
+                version: (typeof chrome !== 'undefined' && chrome.runtime?.getManifest?.()?.version) || 'unknown',
+                tool: 'OmniExporter'
+            };
+        }
 
         return JSON.stringify(exportData, null, 2);
     }
@@ -490,7 +517,8 @@ root.ExportManager = class ExportManager {
     }
 
 }
-} // end if (!window.ExportManager)
-// ExportManager is attached to window inside the block above; popup/options
-// pages access it via the global. No CommonJS shim — the extension is never
-// `require()`'d.
+} // end if (!root.ExportManager)
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = root.ExportManager;
+}

@@ -4,9 +4,10 @@
 
 // ============================================
 // PLATFORM CONFIGURATIONS
-// Use window properties to avoid re-declaration on re-injection
+// Use window/globalThis properties to avoid re-declaration on re-injection
 // ============================================
-window.PLATFORM_CONFIGS = window.PLATFORM_CONFIGS || {
+var _pcRoot = typeof window !== 'undefined' ? window : globalThis;
+_pcRoot.PLATFORM_CONFIGS = _pcRoot.PLATFORM_CONFIGS || {
         Perplexity: {
             name: 'Perplexity',
             baseUrl: 'https://www.perplexity.ai',
@@ -312,7 +313,7 @@ window.PLATFORM_CONFIGS = window.PLATFORM_CONFIGS || {
 
 // Wrap all class declarations in a guard so re-injection on SPA navigation
 // doesn't hit "Identifier 'PlatformConfigManager' has already been declared".
-if (!window.PlatformConfigManager) {
+if (!_pcRoot.PlatformConfigManager) {
 
     // ============================================
     // PLATFORM CONFIG MANAGER (Enhanced with Test Mode)
@@ -336,7 +337,7 @@ if (!window.PlatformConfigManager) {
         }
 
         getConfig(platformName) {
-            const config = window.PLATFORM_CONFIGS[platformName];
+            const config = _pcRoot.PLATFORM_CONFIGS[platformName];
             if (!config) {
                 console.warn(`[PlatformConfig] Unknown platform: ${platformName}`);
                 return null;
@@ -431,7 +432,7 @@ if (!window.PlatformConfigManager) {
          * Extract answer with multiple fallback strategies
          */
         static extractAnswer(entry, platformName = 'Perplexity') {
-            const config = window.PLATFORM_CONFIGS[platformName];
+            const config = _pcRoot.PLATFORM_CONFIGS[platformName];
             if (!config) return '';
 
             const paths = config.dataFields.answer || [];
@@ -456,7 +457,7 @@ if (!window.PlatformConfigManager) {
          * Extract query/question
          */
         static extractQuery(entry, platformName = 'Perplexity') {
-            const config = window.PLATFORM_CONFIGS[platformName];
+            const config = _pcRoot.PLATFORM_CONFIGS[platformName];
             if (!config) return '';
 
             const paths = config.dataFields.query || [];
@@ -476,7 +477,7 @@ if (!window.PlatformConfigManager) {
          * Extract title
          */
         static extractTitle(data, platformName = 'Perplexity') {
-            const config = window.PLATFORM_CONFIGS[platformName];
+            const config = _pcRoot.PLATFORM_CONFIGS[platformName];
             if (!config) return 'Untitled';
 
             const paths = config.dataFields.title || [];
@@ -653,16 +654,26 @@ if (!window.PlatformConfigManager) {
 
     // Register all classes on window so other scripts can access them,
     // and so this guard check works on re-injection.
-    window.PlatformConfigManager = PlatformConfigManager;
-    window.PlatformVersionDetector = PlatformVersionDetector;
-    window.DataExtractor = DataExtractor;
+    _pcRoot.PlatformConfigManager = PlatformConfigManager;
+    _pcRoot.PlatformVersionDetector = PlatformVersionDetector;
+    _pcRoot.DataExtractor = DataExtractor;
 
-} // end if (!window.PlatformConfigManager)
+} // end if (!_pcRoot.PlatformConfigManager)
 
 
-window.platformConfig = window.platformConfig || new window.PlatformConfigManager();
-window.versionDetector = window.versionDetector || new window.PlatformVersionDetector();
+_pcRoot.platformConfig = _pcRoot.platformConfig || new _pcRoot.PlatformConfigManager();
+_pcRoot.versionDetector = _pcRoot.versionDetector || new _pcRoot.PlatformVersionDetector();
 
 
 // Export for content script usage
 console.log('[PlatformConfig] Platform resilience layer loaded');
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        PLATFORM_CONFIGS: _pcRoot.PLATFORM_CONFIGS,
+        PlatformConfigManager: _pcRoot.PlatformConfigManager,
+        PlatformVersionDetector: _pcRoot.PlatformVersionDetector,
+        DataExtractor: _pcRoot.DataExtractor,
+        platformConfig: _pcRoot.platformConfig
+    };
+}

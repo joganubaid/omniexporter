@@ -3,6 +3,26 @@
 Notable changes to OmniExporter. Newest first. Dates are when the change
 landed, not when it was released to the store.
 
+
+## 5.5.1 - 2026-10-29
+
+### Added
+
+- Automated test suite with 35 tests across ExportManager, NotionBlockBuilder,
+  PlatformConfig, SharedUtils, and Manifest integrity. (joganubaid)
+- GitHub Actions CI/CD workflows for automated PR/push checks and release packaging
+  on tag push. (joganubaid)
+- Automated extension packaging tool (`npm run pack`) with SHA-256 generation. (joganubaid)
+- Linter and resource reference validation tool (`npm run lint`). (joganubaid)
+- GitHub issue templates (bug report, feature request) and PR template. (joganubaid)
+
+### Fixed
+
+- Wired up previously orphaned user preferences (`autoSyncNotion`, `skipExported`,
+  `includeMetadata`, `syncImages`, `syncCitations`) across `background.js` auto-sync
+  and `ExportManager` markdown/JSON exports. (joganubaid)
+- Fixed empty `#` links in Dashboard About tab to point to real GitHub documentation
+  and issue tracker. (joganubaid)
 ## 5.5.0 - 2026-05-27
 
 ### Fixed

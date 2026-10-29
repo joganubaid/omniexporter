@@ -113,6 +113,24 @@ omniexporter/
 └── icons/                     Extension and platform icons
 ```
 
+## Development & Testing
+
+Run tests and validation with zero external dependencies (uses Node.js native test runner):
+
+```bash
+# Run automated test suite
+npm test
+
+# Run linter and manifest integrity checks
+npm run lint
+
+# Run all checks (lint + test)
+npm run check
+
+# Package extension bundle for distribution (.zip in dist/)
+npm run pack
+```
+
 ## Known limitations
 
 - MV3 service workers stop after roughly 30 seconds of idle time. All state

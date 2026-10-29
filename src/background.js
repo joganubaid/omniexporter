@@ -364,14 +364,14 @@ async function performAutoSync() {
 
     try {
         const settings = await chrome.storage.local.get([
-            'autoSyncEnabled', 'autoSyncNotion', 'notionApiKey', 'notionKey', 'notionDbId', 'notion_auth_method'
+            'autoSyncEnabled', 'autoSyncNotion', 'notionApiKey', 'notionKey', 'notionDbId', 'notion_auth_method', 'skipExported'
         ]);
         // Stash trace ID on the settings bag so downstream syncToNotion gets it.
         settings._traceId = traceId;
 
-        Logger.debug('AutoSync', 'Settings loaded', { enabled: settings.autoSyncEnabled, dbId: settings.notionDbId ? 'Present' : 'Missing', notionAuth: settings.notion_auth_method }, { traceId });
+        Logger.debug('AutoSync', 'Settings loaded', { enabled: settings.autoSyncEnabled, autoSyncNotion: settings.autoSyncNotion, dbId: settings.notionDbId ? 'Present' : 'Missing', notionAuth: settings.notion_auth_method }, { traceId });
 
-        if (!settings.autoSyncEnabled || !settings.notionDbId) {
+        if (!settings.autoSyncEnabled || settings.autoSyncNotion === false || !settings.notionDbId) {
             Logger.warn('AutoSync', 'Skipped: Not configured or disabled');
             await releaseSyncLock();
             return;
@@ -505,8 +505,10 @@ async function performAutoSync() {
                 continue;
             }
 
-            const newThreads = threads.filter(t => !isAlreadyExported(t.uuid));
-
+            const shouldSkipExported = settings.skipExported !== false;
+            const newThreads = shouldSkipExported
+                ? threads.filter(t => !isAlreadyExported(t.uuid))
+                : [...threads];
             Logger.info('AutoSync', `Found ${newThreads.length} new threads since checkpoint`,
                 { total: threads.length, newCount: newThreads.length, platform });
 

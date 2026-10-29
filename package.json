@@ -1,0 +1,36 @@
+{
+  "name": "omniexporter",
+  "version": "5.5.1",
+  "description": "Export conversations from Perplexity, ChatGPT, Claude, Gemini, Grok & DeepSeek to Markdown, JSON & Notion.",
+  "main": "src/background.js",
+  "scripts": {
+    "test": "node --test tests/**/*.test.js",
+    "lint": "node scripts/lint.js",
+    "pack": "node scripts/package-extension.js",
+    "build": "node scripts/package-extension.js",
+    "check": "npm run lint && npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/joganubaid/omniexporter.git"
+  },
+  "keywords": [
+    "chrome-extension",
+    "ai",
+    "chatgpt",
+    "claude",
+    "gemini",
+    "perplexity",
+    "grok",
+    "deepseek",
+    "notion",
+    "markdown",
+    "export"
+  ],
+  "author": "joganubaid <jonub250383@gmail.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/joganubaid/omniexporter/issues"
+  },
+  "homepage": "https://github.com/joganubaid/omniexporter#readme"
+}

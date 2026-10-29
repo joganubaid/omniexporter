@@ -269,7 +269,13 @@ async function exportCurrentChat(format = 'markdown') {
                     // Use ExportManager if available, fallback to old method
                     if (typeof ExportManager !== 'undefined') {
                         try {
-                            const result = ExportManager.export(response.data, format, currentPlatform);
+                            const exportPrefs = await chrome.storage.local.get(['includeMetadata', 'syncImages', 'syncCitations']);
+                            const exportOptions = {
+                                includeMetadata: exportPrefs.includeMetadata !== false,
+                                syncImages: exportPrefs.syncImages !== false,
+                                syncCitations: exportPrefs.syncCitations !== false
+                            };
+                            const result = ExportManager.export(response.data, format, currentPlatform, exportOptions);
                             setStatus(`Exported as ${result.format}!`, 'success');
                             if (loadingToastId && typeof Toast !== 'undefined') {
                                 Toast.dismiss(loadingToastId);

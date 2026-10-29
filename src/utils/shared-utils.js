@@ -515,3 +515,20 @@ function getContentScriptFiles(url) {
     }
     return ['src/platform-config.js', 'src/content.js'];
 }
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        LoadingManager,
+        InputSanitizer,
+        RequestDeduplicator,
+        RateLimiter,
+        NotionErrorMapper,
+        withRetry,
+        PlatformUrlBuilder,
+        getPlatformUrl,
+        ExportedUuidStore,
+        PLATFORM_CONTENT_SCRIPT_FILES,
+        getContentScriptFiles,
+        splitTextForNotion
+    };
+}

@@ -627,7 +627,7 @@ function buildNotionBlocks(entries, platform, metadata) {
 
     children.push(dividerBlock());
 
-    var safeEntries = Array.isArray(entries) ? entries : [];
+    var safeEntries = Array.isArray(entries) ? entries : (entries?.detail?.entries || entries?.entries || []);
     safeEntries.forEach(function (entry, index) {
         var query = entry.query || entry.query_str || entry.question || entry.prompt || '';
         var blocks = entry.blocks || [];
@@ -804,7 +804,15 @@ function flattenToggleBlocks(blocks) {
 // exposed on the global to avoid hinting at a stable API we don't maintain.
 _nbbRoot.NotionBlockBuilder = {
     buildNotionBlocks: buildNotionBlocks,
-    flattenToggleBlocks: flattenToggleBlocks
+    flattenToggleBlocks: flattenToggleBlocks,
+    // Internal helpers exported for automated unit testing
+    _chunkText: chunkText,
+    _parseInlineMarkdown: parseInlineMarkdown,
+    _markdownToBlocks: markdownToBlocks
 };
 
 } // end window guard
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = _nbbRoot.NotionBlockBuilder;
+}

@@ -1039,11 +1039,9 @@ async function saveAllSettings() {
             // don't exist in options.html. Client ID is loaded from config.js;
             // the secret lives on the Cloudflare Worker.)
         };
-        // TODO: The autoSyncNotion / includeMetadata / syncImages /
-        // syncCitations / skipExported flags above are persisted to storage
-        // but no sync code currently consults them. Either wire them up in
-        // background.js performAutoSync + ExportManager (real feature work)
-        // or remove the checkboxes from options.html + drop these settings.
+        // The autoSyncNotion, skipExported, includeMetadata, syncImages, and
+        // syncCitations flags are actively respected by background.js (performAutoSync)
+        // and ExportManager (toMarkdown / toJSON / export).
 
         // Notion API key validation (only if token selected)
         if (authMethod === 'token' && settings.notionApiKey && !settings.notionApiKey.startsWith('secret_') && !settings.notionApiKey.startsWith('ntn_')) {
@@ -1513,7 +1511,14 @@ function renderThreadList(threads) {
                             payload: { uuid: t.uuid }
                         }, (resp) => {
                             if (resp?.success && typeof ExportManager !== 'undefined') {
-                                ExportManager.export(resp.data, 'markdown', resp.data.platform);
+                                chrome.storage.local.get(['includeMetadata', 'syncImages', 'syncCitations'], (prefs) => {
+                                    const exportOptions = {
+                                        includeMetadata: prefs?.includeMetadata !== false,
+                                        syncImages: prefs?.syncImages !== false,
+                                        syncCitations: prefs?.syncCitations !== false
+                                    };
+                                    ExportManager.export(resp.data, 'markdown', resp.data.platform, exportOptions);
+                                });
                             }
                         });
                     });
@@ -1702,7 +1707,13 @@ async function exportSingleThread(thread) {
 
             // Use shared ExportManager for consistent output and filename parsing
             if (typeof ExportManager !== 'undefined') {
-                ExportManager.export(response.data, 'markdown', currentPlatform);
+                const prefs = await chrome.storage.local.get(['includeMetadata', 'syncImages', 'syncCitations']);
+                const exportOptions = {
+                    includeMetadata: prefs?.includeMetadata !== false,
+                    syncImages: prefs?.syncImages !== false,
+                    syncCitations: prefs?.syncCitations !== false
+                };
+                ExportManager.export(response.data, 'markdown', currentPlatform, exportOptions);
             } else {
                 // Fallback to legacy validation if ExportManager is missing (should not happen)
                 const markdown = formatToMarkdown(response.data);
