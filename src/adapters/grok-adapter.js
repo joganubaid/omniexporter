@@ -285,17 +285,30 @@ var GrokAdapter = window.GrokAdapter = window.GrokAdapter || {
             const entries = [];
             let currentQuery = '';
 
+            // Build attachment metadata lookup map across all messages
+            const metaMap = {};
+            rawMessages.forEach(msg => {
+                const assetList = [
+                    ...(Array.isArray(msg.fileAttachmentsMetadata) ? msg.fileAttachmentsMetadata : []),
+                    ...(Array.isArray(msg.fileAttachmentAssetMetadata) ? msg.fileAttachmentAssetMetadata : [])
+                ];
+                for (const a of assetList) {
+                    const id = a.fileMetadataId || a.assetId || a.id;
+                    if (id) {
+                        metaMap[id] = {
+                            name: a.fileName || a.name || 'attachment',
+                            mime: a.fileMimeType || a.mimeType || '',
+                            size: a.sizeBytes || null
+                        };
+                    }
+                }
+            });
+
             rawMessages.forEach(msg => {
                 // sender is "human" or "assistant" (lowercase)
                 const sender = (msg.sender || msg.role || msg.author || '').toLowerCase();
                 // content field is "message" (not "content" or "text")
                 let content = msg.message || msg.content || msg.text || '';
-
-                // HAR-verified Grok field names (2026-05). Earlier code looked for
-                // `mediaReferences` / `searchResults` / `codeBlocks` — none of those
-                // exist in real Grok responses, so attachments and citations were
-                // silently dropped. Real fields: imageAttachments, fileAttachments,
-                // generatedImageUrls, webSearchResults.
 
                 // Image attachments + Grok-generated images
                 const imageRefs = [
@@ -311,20 +324,20 @@ var GrokAdapter = window.GrokAdapter = window.GrokAdapter || {
                     content = content ? `${content}\n\n${parts.join('\n')}` : parts.join('\n');
                 }
 
-                // File attachments (PDFs, docs, etc.)
+                // File attachments (PDFs, docs, images) - resolves string IDs against metadata map
                 if (Array.isArray(msg.fileAttachments) && msg.fileAttachments.length > 0) {
-                    const parts = msg.fileAttachments.map(f =>
-                        `📎 [File: ${f.fileName || f.name || f.url || 'attachment'}]`
-                    );
+                    const parts = msg.fileAttachments.map(f => {
+                        if (typeof f === 'string' && metaMap[f]) {
+                            const m = metaMap[f];
+                            const sizeLabel = m.size ? ` (${Math.round(m.size / 1024)} KB)` : '';
+                            return `📎 [File: ${m.name}${sizeLabel}]`;
+                        }
+                        return `📎 [File: ${f.fileName || f.name || f.url || 'attachment'}]`;
+                    });
                     content = content ? `${content}\n\n${parts.join('\n')}` : parts.join('\n');
                 }
 
-                // Web search citations. Prefer `citedWebSearchResults` (only
-                // the sources Grok actually cited inline in the answer) over
-                // `webSearchResults` (everything the model retrieved, much of
-                // it unused). Falls back to the broader set if cited isn't
-                // populated, and to the legacy `searchResults` name in case
-                // Grok renames again.
+                // Web search citations
                 const webResults =
                     (Array.isArray(msg.citedWebSearchResults) && msg.citedWebSearchResults.length > 0 && msg.citedWebSearchResults) ||
                     msg.webSearchResults ||
@@ -336,11 +349,31 @@ var GrokAdapter = window.GrokAdapter = window.GrokAdapter || {
                     content = content ? `${content}\n\n${sources.join('\n')}` : sources.join('\n');
                 }
 
-                if (!content.trim()) return;
+                // Cited X posts
+                if (Array.isArray(msg.citedXposts) && msg.citedXposts.length > 0) {
+                    const xparts = msg.citedXposts.map(p => {
+                        const author = p.authorUsername ? `@${p.authorUsername}` : (p.authorName || 'X user');
+                        const postUrl = p.id ? `https://x.com/i/status/${p.id}` : '#';
+                        return `> 🐦 [Post by ${author}](${postUrl}): ${p.text || ''}`;
+                    });
+                    content = content ? `${content}\n\n${xparts.join('\n')}` : xparts.join('\n');
+                }
+
+                // Thinking/reasoning steps (e.g. Grok-3 chain of thought)
+                let thinkingText = '';
+                if (Array.isArray(msg.steps)) {
+                    for (const s of msg.steps) {
+                        if (Array.isArray(s.text)) {
+                            thinkingText += s.text.join('\n') + '\n';
+                        } else if (typeof s.text === 'string') {
+                            thinkingText += s.text + '\n';
+                        }
+                    }
+                }
+
+                if (!content.trim() && !thinkingText.trim()) return;
 
                 if (sender === 'human' || sender === 'user') {
-                    // If two human messages appear consecutively (no assistant turn in between),
-                    // flush the previous query as its own entry so it isn't silently dropped.
                     if (currentQuery) {
                         entries.push({
                             query_str: currentQuery,
@@ -350,13 +383,17 @@ var GrokAdapter = window.GrokAdapter = window.GrokAdapter || {
                     }
                     currentQuery = content.trim();
                 } else if ((sender === 'assistant' || sender === 'grok' || sender === 'ai') && currentQuery) {
+                    const block = {
+                        intended_usage: 'ask_text',
+                        markdown_block: { answer: content.trim() }
+                    };
+                    if (thinkingText.trim()) {
+                        block.thinking = thinkingText.trim();
+                    }
                     entries.push({
                         query_str: currentQuery,
                         query: currentQuery,
-                        blocks: [{
-                            intended_usage: 'ask_text',
-                            markdown_block: { answer: content.trim() }
-                        }]
+                        blocks: [block]
                     });
                     currentQuery = '';
                 }

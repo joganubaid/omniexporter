@@ -31,6 +31,19 @@ var ClaudeAdapter = window.ClaudeAdapter = window.ClaudeAdapter || {
     //   3. Copy the anthropic-client-sha request header value here
     // ============================================
     _getHeaders: () => {
+        let clientSha = '9f94910bb319abfbb3f61a3950f57e2804cf87be';
+        if (typeof document !== 'undefined') {
+            try {
+                const scripts = document.querySelectorAll('script[src*="_next/static"]');
+                for (const s of scripts) {
+                    const match = s.src.match(/static\/([a-zA-Z0-9_-]{30,45})\//);
+                    if (match && match[1]) {
+                        clientSha = match[1];
+                        break;
+                    }
+                }
+            } catch (_) {}
+        }
         const headers = {
             'Accept': '*/*',
             'Accept-Language': 'en-US,en;q=0.9',
@@ -40,7 +53,7 @@ var ClaudeAdapter = window.ClaudeAdapter = window.ClaudeAdapter || {
             'Sec-Fetch-Site': 'same-origin',
             'anthropic-client-platform': 'web_claude_ai',
             'anthropic-client-version': '1.0.0',
-            'anthropic-client-sha': '9f94910bb319abfbb3f61a3950f57e2804cf87be',
+            'anthropic-client-sha': clientSha,
             'anthropic-device-id': '00000000-0000-4000-8000-000000000000',
             'x-activity-session-id': ClaudeAdapter._sessionId || (ClaudeAdapter._sessionId = crypto.randomUUID())
         };

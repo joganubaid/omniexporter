@@ -18,6 +18,19 @@ landed, not when it was released to the store.
 
 ### Fixed
 
+- Perplexity: Fixed missing assistant responses and raw JSON dumps for Copilot/Comet queries
+  where `entry.text` contains step-execution JSON arrays (`INITIAL_QUERY`, `SEARCH_WEB`,
+  `SEARCH_RESULTS`, `FINAL`) and `blocks` is undefined. The adapter now parses step answers,
+  extracts web results into sources, and captures thinking/reasoning blocks. (joganubaid)
+- Grok: Fixed file attachment metadata resolution when `msg.fileAttachments` contains string UUIDs
+  by cross-referencing `fileAttachmentsMetadata` and `fileAttachmentAssetMetadata`. Added
+  extraction for Grok-3 chain-of-thought thinking steps and cited X posts. (joganubaid)
+- ChatGPT: Switched tree mapping to trace active conversation path backwards from `data.current_node`
+  to root, eliminating branch desynchronization when conversations contain multiple regenerations. (joganubaid)
+- Claude: Added dynamic Next.js build hash detection for `anthropic-client-sha` to prevent
+  stale client SHA 4xx rejections on Anthropic frontend deployments. (joganubaid)
+- ExportManager: Added Assistant fallback in `toMarkdown` so conversations without explicit
+  block wrappers never silently drop assistant answers. (joganubaid)
 - Wired up previously orphaned user preferences (`autoSyncNotion`, `skipExported`,
   `includeMetadata`, `syncImages`, `syncCitations`) across `background.js` auto-sync
   and `ExportManager` markdown/JSON exports. (joganubaid)

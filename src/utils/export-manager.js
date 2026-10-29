@@ -210,6 +210,11 @@ root.ExportManager = class ExportManager {
                     });
                     md += '\n';
                 }
+            } else {
+                const ans = this.extractAnswer(entry);
+                if (ans && ans.trim()) {
+                    md += `### Assistant\n\n${ans.trim()}\n\n`;
+                }
             }
 
             // Sources (from blocks or entry-level, not already shown as citations)
@@ -385,9 +390,27 @@ root.ExportManager = class ExportManager {
         }
 
         if (!answer.trim()) {
-            answer = ExportManager._stripHtml(entry.answer || entry.text || '');
+            const raw = entry.answer || entry.text || '';
+            if (typeof raw === 'string' && raw.trim().startsWith('[')) {
+                try {
+                    const steps = JSON.parse(raw);
+                    if (Array.isArray(steps)) {
+                        for (const s of steps) {
+                            if (s.step_type === 'FINAL' && s.content?.answer) {
+                                let a = s.content.answer;
+                                if (typeof a === 'string' && a.trim().startsWith('{')) {
+                                    try { a = JSON.parse(a).answer || a; } catch (_) {}
+                                }
+                                answer = ExportManager._stripHtml(a);
+                            }
+                        }
+                    }
+                } catch (_) {}
+            }
+            if (!answer.trim()) {
+                answer = ExportManager._stripHtml(raw);
+            }
         }
-
         return answer;
     }
 

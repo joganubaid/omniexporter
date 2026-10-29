@@ -344,7 +344,83 @@ async function fetchPerplexityDetailResilient(uuid) {
             isInitial = false;
         }
         console.log('[OmniExporter] Final result - Title:', title, 'Entries:', entries.length);
-        const enrichedEntries = entries.map(entry => {
+        const normalizeEntry = (entry) => {
+            if (!entry) return entry;
+            const normalized = { ...entry };
+
+            // If blocks is already populated, keep it
+            if (Array.isArray(normalized.blocks) && normalized.blocks.length > 0) {
+                return normalized;
+            }
+
+            // Check if text is a JSON array of steps (Copilot / Comet execution steps)
+            const rawText = typeof normalized.text === 'string' ? normalized.text.trim() : '';
+            if (rawText.startsWith('[')) {
+                try {
+                    const steps = JSON.parse(rawText);
+                    if (Array.isArray(steps)) {
+                        let finalAnswer = '';
+                        const stepSources = [];
+                        let thinking = '';
+
+                        for (const step of steps) {
+                            const content = step.content || {};
+                            if (content.thought || content.reasoning) {
+                                thinking += (content.thought || content.reasoning) + '\n\n';
+                            }
+                            if (Array.isArray(content.web_results)) {
+                                for (const wr of content.web_results) {
+                                    stepSources.push({
+                                        title: wr.name || wr.title || wr.url || '',
+                                        url: wr.url || wr.link || ''
+                                    });
+                                }
+                            }
+                            if (step.step_type === 'FINAL' && content.answer) {
+                                let ans = content.answer;
+                                if (typeof ans === 'string' && ans.trim().startsWith('{')) {
+                                    try {
+                                        const parsedAns = JSON.parse(ans);
+                                        ans = parsedAns.answer || parsedAns.text || ans;
+                                    } catch (_) {}
+                                }
+                                finalAnswer = typeof ans === 'string' ? ans : JSON.stringify(ans);
+                            }
+                        }
+
+                        normalized.blocks = [];
+                        if (thinking.trim()) {
+                            normalized.blocks.push({
+                                intended_usage: 'thinking',
+                                thinking: thinking.trim()
+                            });
+                        }
+                        if (finalAnswer.trim()) {
+                            normalized.blocks.push({
+                                intended_usage: 'ask_text',
+                                markdown_block: { answer: finalAnswer.trim() }
+                            });
+                        }
+                        if (stepSources.length > 0 && (!normalized.sources || normalized.sources.length === 0)) {
+                            normalized.sources = stepSources;
+                        }
+                        return normalized;
+                    }
+                } catch (_) {}
+            }
+
+            // Plain text fallback
+            if (rawText) {
+                normalized.blocks = [{
+                    intended_usage: 'ask_text',
+                    markdown_block: { answer: rawText }
+                }];
+            }
+
+            return normalized;
+        };
+
+        const enrichedEntries = entries.map(normalizeEntry).map(entry => {
             if (!entry.blocks || !Array.isArray(entry.blocks)) return entry;
             const enriched = { ...entry };
             const mediaParts = [];

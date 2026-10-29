@@ -367,35 +367,51 @@ function transformChatGPTData(data) {
             console.log('[ChatGPT] Transforming using Tree Strategy (mapping)');
             const mapping = data.mapping;
 
-            // Find root
-            let currentNodeId = null;
-            for (const [id, node] of Object.entries(mapping)) {
-                if (!node.parent) {
-                    currentNodeId = id;
-                    break;
+            // PREFERRED: If data.current_node exists, trace active path backwards to root
+            if (data.current_node && mapping[data.current_node]) {
+                let curr = data.current_node;
+                const pathMessages = [];
+                const visited = new Set();
+                while (curr && mapping[curr] && !visited.has(curr)) {
+                    visited.add(curr);
+                    const node = mapping[curr];
+                    if (node?.message) {
+                        pathMessages.push(node.message);
+                    }
+                    curr = node.parent;
                 }
-            }
-            if (!currentNodeId && Object.keys(mapping).length > 0) {
-                currentNodeId = Object.keys(mapping)[0];
-            }
-
-            const visited = new Set();
-            while (currentNodeId && !visited.has(currentNodeId)) {
-                visited.add(currentNodeId);
-                const node = mapping[currentNodeId];
-                if (node?.message) {
-                    orderedMessages.push(node.message);
-                }
-                if (node?.children && node.children.length > 0) {
-                    // Follow the LAST child: ChatGPT appends a new child for each
-                    // regeneration, so the last child is the most recently selected branch.
-                    // Using children[0] (first) would always export the original/stale answer.
-                    currentNodeId = node.children[node.children.length - 1];
-                } else {
-                    break;
+                if (pathMessages.length > 0) {
+                    orderedMessages = pathMessages.reverse();
                 }
             }
 
+            // Forward traversal fallback if current_node path was not available
+            if (orderedMessages.length === 0) {
+                let currentNodeId = null;
+                for (const [id, node] of Object.entries(mapping)) {
+                    if (!node.parent) {
+                        currentNodeId = id;
+                        break;
+                    }
+                }
+                if (!currentNodeId && Object.keys(mapping).length > 0) {
+                    currentNodeId = Object.keys(mapping)[0];
+                }
+
+                const visited = new Set();
+                while (currentNodeId && !visited.has(currentNodeId)) {
+                    visited.add(currentNodeId);
+                    const node = mapping[currentNodeId];
+                    if (node?.message) {
+                        orderedMessages.push(node.message);
+                    }
+                    if (node?.children && node.children.length > 0) {
+                        currentNodeId = node.children[node.children.length - 1];
+                    } else {
+                        break;
+                    }
+                }
+            }
             // Fallback: if traversal failed but we have mapping
             if (orderedMessages.length === 0) {
                 // console.warn('[ChatGPT] Tree traversal yielded 0 messages, using fallback sort');
