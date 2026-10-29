@@ -168,7 +168,7 @@ var GeminiAdapter = window.GeminiAdapter = window.GeminiAdapter || {
     get apiBase() {
         const config = this.config;
         const endpoint = typeof platformConfig !== 'undefined'
-            ? platformConfig.getEndpoint('Gemini', 'conversations')
+            ? platformConfig.buildEndpoint('Gemini', 'conversations')
             : '/_/BardChatUi/data/batchexecute';
         return config ? config.baseUrl + endpoint : `https://gemini.google.com${endpoint}`;
     },

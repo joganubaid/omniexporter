@@ -1031,7 +1031,9 @@ async function loadSettings() {
 
 async function saveAllSettings() {
     try {
-        let authMethod = document.querySelector('input[name="notionAuthMethod"]:checked')?.value || 'token';
+        const currentStored = await chrome.storage.local.get(['notion_auth_method']);
+        const tokenInput = getVal('notionKey');
+        const authMethod = tokenInput ? 'token' : (currentStored.notion_auth_method || 'token');
 
         // Helper to check element existence
         const getVal = (id) => {
@@ -1048,7 +1050,7 @@ async function saveAllSettings() {
             syncImages: document.getElementById('syncImages')?.checked || false,
             syncCitations: document.getElementById('syncCitations')?.checked || false,
             skipExported: document.getElementById('skipExported')?.checked || false,
-            notion_auth_method: getVal('notionKey') ? 'token' : authMethod
+            notion_auth_method: authMethod
             // (Removed: notion_oauth_client_id/_secret — the inputs they read
             // don't exist in options.html. Client ID is loaded from config.js;
             // the secret lives on the Cloudflare Worker.)

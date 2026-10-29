@@ -519,6 +519,7 @@ function transformChatGPTData(data) {
                             } else {
                                 parts.push(`🖼️ [Image: ${desc}]`);
                             }
+                        } else if (p.content_type === 'file_asset_pointer') {
                             const fileName = p.metadata?.file_name || p.name || 'Uploaded file';
                             parts.push(`📎 [File: ${fileName}]`);
                         } else if (p.text) {

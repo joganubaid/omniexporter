@@ -140,6 +140,7 @@ root.ExportManager = class ExportManager {
                             } else {
                                 md += `> *Image attachment: [${name}](${safeUrl})*\n\n`;
                             }
+                        } else if (att.extracted_content) {
                             // Use ~~~ fence when content already contains ``` to avoid breaking out
                             const fence = att.extracted_content.includes('```') ? '~~~' : '```';
                             md += `<details>\n<summary><strong>Attachment: ${name}</strong> (${att.extracted_content.length} chars)</summary>\n\n`;
