@@ -666,12 +666,26 @@ function toggleNotionAuthSections(method) {
     }
 }
 
-function updateOauthStatus(data) {
+async function updateOauthStatus(data = {}) {
     const statusEl = document.getElementById('notionOauthStatus');
     if (!statusEl) return;
-    const connected = !!data?.notion_oauth_workspace_name;
-    if (connected) {
-        statusEl.textContent = `Connected: ${data.notion_oauth_workspace_name}`;
+    const stored = await chrome.storage.local.get([
+        'notion_oauth_workspace_name',
+        'notionApiKey',
+        'notionKey',
+        'notion_bot_name'
+    ]);
+    const merged = { ...stored, ...data };
+    const keyVal = document.getElementById('notionKey')?.value.trim();
+    const hasToken = !!(merged.notionApiKey || merged.notionKey || keyVal);
+    const hasOauth = !!merged.notion_oauth_workspace_name;
+
+    if (hasOauth) {
+        statusEl.textContent = `Connected: ${merged.notion_oauth_workspace_name} (OAuth)`;
+        statusEl.classList.add('connected');
+    } else if (hasToken) {
+        const name = merged.notion_bot_name || 'Internal Token';
+        statusEl.textContent = `Connected: ${name}`;
         statusEl.classList.add('connected');
     } else {
         statusEl.textContent = 'Not connected';
@@ -688,17 +702,17 @@ async function resolveNotionToken() {
 
 async function handleOauthConnect() {
     try {
-        // Capture whatever the user has typed in the DB ID field BEFORE the OAuth flow runs.
-        // If they've pre-filled their own database ID we must preserve it — the auto-create
-        // logic inside storeTokens() will only skip creation when a DB ID is already in
-        // storage, so we save it to storage first via saveAllSettings().
+        if (typeof NOTION_CLIENT_ID === 'undefined' || !NOTION_CLIENT_ID || NOTION_CLIENT_ID === 'YOUR_CLIENT_ID_HERE') {
+            log('OAuth requires a Public Notion Integration. For your internal token, enter it above and click "Test & Save Connection".', 'warn');
+            return;
+        }
         const dbIdInput = document.getElementById('notionDbId');
         const userTypedDbId = dbIdInput ? dbIdInput.value.trim() : '';
 
-        await saveAllSettings();              // saves userTypedDbId to storage if valid
+        await saveAllSettings();
         await NotionOAuth.init();
         log('🔐 Starting OAuth flow...', 'info');
-        await NotionOAuth.authorize();        // → storeTokens() → createExportDatabase() only if no DB ID in storage
+        await NotionOAuth.authorize();
         const status = await NotionOAuth.getStatus();
         updateOauthStatus({ notion_oauth_workspace_name: status.workspace });
         await chrome.storage.local.set({ notion_auth_method: 'oauth' });
@@ -1109,6 +1123,12 @@ async function testNotionConnection() {
         const userData = await userRes.json();
         const botName = userData.name || 'OmniExporter';
         const workspaceName = userData.bot?.workspace_name || '';
+        await chrome.storage.local.set({
+            notionApiKey: token,
+            notion_auth_method: 'token',
+            notion_bot_name: botName
+        });
+        await updateOauthStatus();
 
         if (!dbId) {
             resultEl.innerHTML = `✅ Token active (${escapeHtml(botName)}${workspaceName ? ' · ' + escapeHtml(workspaceName) : ''})! Paste Database ID below.`;
@@ -1134,9 +1154,11 @@ async function testNotionConnection() {
         if (response.ok) {
             const data = await response.json();
             const dbTitle = data.title?.[0]?.plain_text || 'Database';
+            await chrome.storage.local.set({ notionDbId: dbId, notionDbName: dbTitle });
             resultEl.innerHTML = `✅ Connected: "${escapeHtml(dbTitle)}" (${escapeHtml(botName)})`;
             resultEl.style.color = 'var(--success)';
             log(`Notion connection successful: ${dbTitle}`, 'success');
+            await updateOauthStatus();
         } else {
             const error = await response.json().catch(() => ({}));
             resultEl.innerHTML = `❌ Database access failed: ${escapeHtml(error.message || 'Make sure database is shared with connection')}`;

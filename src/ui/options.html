@@ -190,25 +190,30 @@
             <div class="setting-row">
               <label class="setting-label">Integration Token (Internal)</label>
               <input type="password" id="notionKey" class="input" placeholder="ntn_... or secret_...">
-              <p class="setting-hint">Direct integration token (recommended). Paste your secret from notion.so/profile/integrations.</p>
-            </div>
-            <div class="setting-row">
-              <label class="setting-label">OAuth2 (Alternative)</label>
-              <div class="oauth-row">
-                <span id="notionOauthStatus" class="status-pill">Not connected</span>
-                <button id="connectNotionOauth" class="btn-sm btn-white">Connect Notion</button>
-                <button id="disconnectNotionOauth" class="btn-sm btn-danger" style="display:none">Disconnect</button>
-              </div>
+              <p class="setting-hint">Paste your internal integration secret from notion.so/profile/integrations.</p>
             </div>
             <div class="setting-row">
               <label class="setting-label">Database ID</label>
-              <input type="text" id="notionDbId" class="input" placeholder="Auto-created on connect">
-              <p class="setting-hint">Auto-created when you connect, or paste an existing database ID.</p>
+              <input type="text" id="notionDbId" class="input" placeholder="32-character Notion database ID">
+              <p class="setting-hint">Found in your Notion database URL: notion.so/.../<strong>[database-id]</strong>?v=...</p>
             </div>
             <div class="setting-row">
-              <button id="testNotionBtn" class="btn-sm btn-outline">Test Connection</button>
+              <div class="oauth-row">
+                <button id="testNotionBtn" class="btn-sm btn-white">Test &amp; Save Connection</button>
+                <span id="notionOauthStatus" class="status-pill">Not connected</span>
+              </div>
               <span id="notionTestResult" class="test-result"></span>
             </div>
+            <details class="setting-details">
+              <summary class="setting-details-summary">Advanced: OAuth2 via Cloudflare Worker</summary>
+              <div class="setting-details-body">
+                <p class="setting-hint">For Public multi-workspace integrations only. Requires OAuth enabled in Notion developer portal.</p>
+                <div class="oauth-row">
+                  <button id="connectNotionOauth" class="btn-sm btn-outline">Connect via OAuth</button>
+                  <button id="disconnectNotionOauth" class="btn-sm btn-danger" style="display:none">Disconnect</button>
+                </div>
+              </div>
+            </details>
           </div>
         </div>
 
