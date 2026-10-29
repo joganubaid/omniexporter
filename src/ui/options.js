@@ -755,7 +755,7 @@ async function handleOauthDisconnect() {
 document.addEventListener('DOMContentLoaded', async () => {
     // Surface the manifest version in the sidebar + About tab so they always
     // match the installed extension — no hardcoded version strings to drift.
-    const v = chrome.runtime.getManifest().version;
+    const v = (typeof chrome !== 'undefined' && chrome.runtime?.getManifest?.()?.version) || '5.5.1';
     const brandEl = document.getElementById('brandVersion');
     if (brandEl) brandEl.textContent = 'v' + v;
     const aboutEl = document.getElementById('aboutVersion');
