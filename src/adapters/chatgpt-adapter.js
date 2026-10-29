@@ -502,8 +502,13 @@ function transformChatGPTData(data) {
                     } else if (p && typeof p === 'object') {
                         if (p.content_type === 'image_asset_pointer') {
                             const desc = p.metadata?.dalle?.prompt || 'Generated image';
-                            parts.push(`🖼️ [Image: ${desc}]`);
-                        } else if (p.content_type === 'file_asset_pointer') {
+                            const fileId = p.asset_pointer ? p.asset_pointer.replace(/^(?:sediment|file-service):\/\//, '').split('?')[0] : null;
+                            if (fileId && data.conversation_id) {
+                                const downloadUrl = `https://chatgpt.com/backend-api/files/download/${encodeURIComponent(fileId)}?conversation_id=${encodeURIComponent(data.conversation_id)}&download_intent=false&inline=true`;
+                                parts.push(`![${desc}](${downloadUrl})`);
+                            } else {
+                                parts.push(`🖼️ [Image: ${desc}]`);
+                            }
                             const fileName = p.metadata?.file_name || p.name || 'Uploaded file';
                             parts.push(`📎 [File: ${fileName}]`);
                         } else if (p.text) {

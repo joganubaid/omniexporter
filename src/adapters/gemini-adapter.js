@@ -167,7 +167,10 @@ var GeminiAdapter = window.GeminiAdapter = window.GeminiAdapter || {
 
     get apiBase() {
         const config = this.config;
-        return config ? config.baseUrl + '/_/BardChatUi/data/batchexecute' : 'https://gemini.google.com/_/BardChatUi/data/batchexecute';
+        const endpoint = typeof platformConfig !== 'undefined'
+            ? platformConfig.getEndpoint('Gemini', 'conversations')
+            : '/_/BardChatUi/data/batchexecute';
+        return config ? config.baseUrl + endpoint : `https://gemini.google.com${endpoint}`;
     },
 
     // Cache for pagination cursors
@@ -695,10 +698,22 @@ var GeminiAdapter = window.GeminiAdapter = window.GeminiAdapter || {
                             try {
                                 // Walk through candidate to find model string
                                 const candidateStr = JSON.stringify(candidate);
-                                const modelMatch = candidateStr.match(/"((?:2\.5|2\.0|1\.5|1\.0)\s+(?:Flash|Pro|Ultra|Nano)[^"]*?)"/);
+                                const modelMatch = candidateStr.match(/"((?:3\.[0-9]|2\.[0-9]|1\.[0-9])\s+(?:Flash|Pro|Ultra|Nano|Thinking)[^"]*?)"/i);
                                 if (modelMatch) model = modelMatch[1];
                             } catch (e) { /* ignore */ }
                         }
+
+                        // Extract Imagen generated images
+                        try {
+                            const candidateStr = JSON.stringify(candidate);
+                            const imgMatches = candidateStr.match(/https?:\/\/[^"\\]*googleusercontent\.com\/image_generation_content\/[^"\\]+/g);
+                            if (imgMatches) {
+                                const uniqueImgs = [...new Set(imgMatches)];
+                                for (const imgUrl of uniqueImgs) {
+                                    answer += `\n\n![Generated Image](${imgUrl})`;
+                                }
+                            }
+                        } catch (e) { /* ignore image errors */ }
 
                         // Extract citation sources from candidate metadata
                         // Citations appear as arrays of [title, url, snippet] in deep positions

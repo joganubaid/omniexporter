@@ -845,10 +845,16 @@ async function syncToNotion(data, settings) {
                     properties['URL'] = { url: platformUrl };
                 }
             }
-            if (dbSchema.properties['Tags']?.type === 'multi_select')
-                properties['Tags'] = { multi_select: [{ name: data.platform || 'AI' }] };
-            if (dbSchema.properties['Platform']?.type === 'select')
-                properties['Platform'] = { select: { name: data.platform || 'AI' } };
+            if (dbSchema.properties['Tags']) {
+                const prop = (typeof mapNotionSelectOrTextProperty === 'function' ? mapNotionSelectOrTextProperty : null)?.(dbSchema.properties['Tags'], data.platform || 'AI');
+                if (prop) properties['Tags'] = prop;
+                else if (dbSchema.properties['Tags']?.type === 'multi_select') properties['Tags'] = { multi_select: [{ name: data.platform || 'AI' }] };
+            }
+            if (dbSchema.properties['Platform']) {
+                const prop = (typeof mapNotionSelectOrTextProperty === 'function' ? mapNotionSelectOrTextProperty : null)?.(dbSchema.properties['Platform'], data.platform || 'AI');
+                if (prop) properties['Platform'] = prop;
+                else if (dbSchema.properties['Platform']?.type === 'select') properties['Platform'] = { select: { name: data.platform || 'AI' } };
+            }
             if (dbSchema.properties['Chat Time']?.type === 'date') {
                 const rawDate = data.detail?.last_query_datetime
                     || data.detail?.entries?.[0]?.created_datetime

@@ -698,7 +698,12 @@ async function buildNotionProperties(data, dbId, apiKey, entries = []) {
             properties['Space Name'] = { rich_text: [{ type: "text", text: { content: data.spaceName } }] };
         }
         if (availableProps['Platform']) {
-            properties.Platform = { select: { name: currentPlatform || 'Unknown' } };
+            const prop = mapNotionSelectOrTextProperty(availableProps['Platform'], currentPlatform || 'Unknown');
+            if (prop) properties.Platform = prop;
+        }
+        if (availableProps['Tags']) {
+            const prop = mapNotionSelectOrTextProperty(availableProps['Tags'], currentPlatform || 'AI');
+            if (prop) properties.Tags = prop;
         }
     } catch (error) {
         console.warn('[OmniExporter] Property build failed:', error.message);

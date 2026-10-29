@@ -237,6 +237,19 @@ const NotionErrorMapper = {
     }
 };
 
+/**
+ * Maps a string value to a Notion property structure based on the column type.
+ * Handles select, multi_select, and rich_text without throwing 400 validation errors.
+ */
+function mapNotionSelectOrTextProperty(propSchema, value) {
+    if (!propSchema || !value) return null;
+    const type = propSchema.type;
+    if (type === 'select') return { select: { name: String(value).slice(0, 100) } };
+    if (type === 'multi_select') return { multi_select: [{ name: String(value).slice(0, 100) }] };
+    if (type === 'rich_text') return { rich_text: [{ type: 'text', text: { content: String(value).slice(0, 2000) } }] };
+    return null;
+}
+
 // ============================================
 // RETRY WITH EXPONENTIAL BACKOFF
 // ============================================
@@ -523,6 +536,7 @@ if (typeof module !== 'undefined' && module.exports) {
         RequestDeduplicator,
         RateLimiter,
         NotionErrorMapper,
+        mapNotionSelectOrTextProperty,
         withRetry,
         PlatformUrlBuilder,
         getPlatformUrl,

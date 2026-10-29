@@ -307,9 +307,29 @@ var GrokAdapter = window.GrokAdapter = window.GrokAdapter || {
             rawMessages.forEach(msg => {
                 // sender is "human" or "assistant" (lowercase)
                 const sender = (msg.sender || msg.role || msg.author || '').toLowerCase();
-                // content field is "message" (not "content" or "text")
+                // Content resolution: prefer message, fall back to inputChunks or outputChunks
                 let content = msg.message || msg.content || msg.text || '';
+                if (!content && msg.sender === 'human' && Array.isArray(msg.inputChunks)) {
+                    content = msg.inputChunks.map(c => c.text?.text || c.text || '').join('');
+                }
+                if (!content && Array.isArray(msg.outputChunks)) {
+                    const assistantChunks = msg.outputChunks.filter(c => c.text && c.text.channel === 'CHANNEL_ASSISTANT_RESPONSE');
+                    const targetChunks = assistantChunks.length > 0 ? assistantChunks : msg.outputChunks;
+                    content = targetChunks.map(c => c.text?.text || c.text || '').join('');
+                }
 
+                // Clean unrendered <grok:render> card tags
+                if (content.includes('<grok:render')) {
+                    content = content
+                        .replace(/<grok:render[\s\S]*?<\/grok:render>/g, '\n')
+                        .replace(/<grok:render\b[^>]*\/>/g, '\n')
+                        .replace(/\n{3,}/g, '\n\n');
+                }
+
+                // Normalize LaTeX delimiters \[...\] and \(...\) to $$ and $
+                content = content
+                    .replace(/\\\[([\s\S]*?)\\\]/g, '$$$$$1$$$$')
+                    .replace(/\\\(([\s\S]*?)\\\)/g, '$$$1$$');
                 // Image attachments + Grok-generated images
                 const imageRefs = [
                     ...(Array.isArray(msg.imageAttachments) ? msg.imageAttachments : []),

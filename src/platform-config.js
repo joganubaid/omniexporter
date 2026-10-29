@@ -165,7 +165,7 @@ _pcRoot.PLATFORM_CONFIGS = _pcRoot.PLATFORM_CONFIGS || {
                 // HAR-verified: batchexecute is the single endpoint for all Gemini API calls
                 conversations: {
                     primary: '/_/BardChatUi/data/batchexecute', // VERIFIED: 2026-02-19
-                    fallback: '/app' // FALLBACK
+                    fallback: '/_/LabsTailwindUi/data/batchexecute' // VERIFIED: 2026-05
                 }
             },
             // HAR-verified RPC IDs (2026-02-16)
@@ -279,9 +279,8 @@ _pcRoot.PLATFORM_CONFIGS = _pcRoot.PLATFORM_CONFIGS || {
                     params: () => '?lte_cursor.pinned=false'
                 },
                 conversationDetail: {
-                    primary: '/api/v0/chat/history_messages', // VERIFIED: 2026-03-16
-                    fallback: '/api/v0/chat/history_messages',
-                    params: (uuid) => `?chat_session_id=${uuid}&cache_version=2`
+                    primary: '/api/v0/chat/history_messages?chat_session_id={uuid}&cache_version=0', // VERIFIED: 2026-03-16
+                    fallback: '/api/v0/chat/history_messages?chat_session_id={uuid}&cache_version=0'
                 }
                 // Archived DeepSeek endpoints (HAR-verified, not currently used):
                 //   chatSession:    /api/v0/chat_session/{uuid}
@@ -380,7 +379,7 @@ if (!_pcRoot.PlatformConfigManager) {
             // Add query parameters
             if (endpoint.params && typeof endpoint.params === 'function') {
                 const version = this.activeVersions.get(platformName) || config.versions.current;
-                url += endpoint.params(version);
+                url += endpoint.params(version, params);
             }
 
             return url;

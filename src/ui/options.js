@@ -2257,16 +2257,14 @@ async function buildNotionProperties(data, dbId, apiKey, entries = []) {
 
         // Platform column
         if (availableProps['Platform']) {
-            properties.Platform = {
-                select: { name: currentPlatform || 'Unknown' }
-            };
+            const prop = mapNotionSelectOrTextProperty(availableProps['Platform'], currentPlatform || 'Unknown');
+            if (prop) properties.Platform = prop;
         }
 
         // Tags column (if it exists)
         if (availableProps['Tags']) {
-            properties.Tags = {
-                multi_select: [{ name: currentPlatform || 'AI' }]
-            };
+            const prop = mapNotionSelectOrTextProperty(availableProps['Tags'], currentPlatform || 'AI');
+            if (prop) properties.Tags = prop;
         }
 
     } catch (error) {
