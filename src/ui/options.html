@@ -188,7 +188,12 @@
               Your credentials are stored locally in this browser only.
             </div>
             <div class="setting-row">
-              <label class="setting-label">Connection</label>
+              <label class="setting-label">Integration Token (Internal)</label>
+              <input type="password" id="notionKey" class="input" placeholder="ntn_... or secret_...">
+              <p class="setting-hint">Direct integration token (recommended). Paste your secret from notion.so/profile/integrations.</p>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">OAuth2 (Alternative)</label>
               <div class="oauth-row">
                 <span id="notionOauthStatus" class="status-pill">Not connected</span>
                 <button id="connectNotionOauth" class="btn-sm btn-white">Connect Notion</button>

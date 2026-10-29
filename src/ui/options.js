@@ -1017,7 +1017,7 @@ async function loadSettings() {
 
 async function saveAllSettings() {
     try {
-        const authMethod = document.querySelector('input[name="notionAuthMethod"]:checked')?.value || 'oauth';
+        let authMethod = document.querySelector('input[name="notionAuthMethod"]:checked')?.value || 'token';
 
         // Helper to check element existence
         const getVal = (id) => {
@@ -1034,7 +1034,7 @@ async function saveAllSettings() {
             syncImages: document.getElementById('syncImages')?.checked || false,
             syncCitations: document.getElementById('syncCitations')?.checked || false,
             skipExported: document.getElementById('skipExported')?.checked || false,
-            notion_auth_method: authMethod
+            notion_auth_method: getVal('notionKey') ? 'token' : authMethod
             // (Removed: notion_oauth_client_id/_secret — the inputs they read
             // don't exist in options.html. Client ID is loaded from config.js;
             // the secret lives on the Cloudflare Worker.)
@@ -1044,7 +1044,8 @@ async function saveAllSettings() {
         // and ExportManager (toMarkdown / toJSON / export).
 
         // Notion API key validation (only if token selected)
-        if (authMethod === 'token' && settings.notionApiKey && !settings.notionApiKey.startsWith('secret_') && !settings.notionApiKey.startsWith('ntn_')) {
+        // Notion API key validation
+        if (settings.notionApiKey && !settings.notionApiKey.startsWith('secret_') && !settings.notionApiKey.startsWith('ntn_')) {
             log('⚠️ Invalid Notion API Key format. Should start with secret_ or ntn_', 'error');
             return;
         }
@@ -1080,26 +1081,48 @@ async function testNotionConnection() {
     const resultEl = document.getElementById('notionTestResult');
     const btnEl = document.getElementById('testNotionBtn');
     const dbId = document.getElementById('notionDbId').value.trim();
-
-    if (!dbId) {
-        resultEl.innerHTML = '❌ Enter Database ID first';
-        resultEl.style.color = 'var(--error)';
-        return;
-    }
-
-    // Validate database ID format
-    if (!isValidNotionDatabaseId(dbId)) {
-        resultEl.innerHTML = '❌ Invalid Database ID format. Should be a 32-character ID.';
-        resultEl.style.color = 'var(--error)';
-        return;
-    }
-
     btnEl.disabled = true;
     btnEl.textContent = '⏳ Testing...';
     resultEl.innerHTML = '';
 
     try {
+        const keyInput = document.getElementById('notionKey')?.value.trim();
+        if (keyInput) {
+            await chrome.storage.local.set({ notionApiKey: keyInput, notion_auth_method: 'token' });
+        }
         const token = await resolveNotionToken();
+
+        // First verify token against users/me
+        const userRes = await fetch('https://api.notion.com/v1/users/me', {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Notion-Version': '2022-06-28'
+            }
+        });
+
+        if (!userRes.ok) {
+            const err = await userRes.json().catch(() => ({}));
+            throw new Error(err.message || 'Invalid Notion Token. Please check your credentials.');
+        }
+
+        const userData = await userRes.json();
+        const botName = userData.name || 'OmniExporter';
+        const workspaceName = userData.bot?.workspace_name || '';
+
+        if (!dbId) {
+            resultEl.innerHTML = `✅ Token active (${escapeHtml(botName)}${workspaceName ? ' · ' + escapeHtml(workspaceName) : ''})! Paste Database ID below.`;
+            resultEl.style.color = 'var(--success)';
+            log(`Notion token verified for ${botName}`, 'success');
+            return;
+        }
+
+        if (!isValidNotionDatabaseId(dbId)) {
+            resultEl.innerHTML = `⚠️ Token valid for ${escapeHtml(botName)}, but Database ID format is invalid (must be 32 chars).`;
+            resultEl.style.color = 'var(--warning)';
+            return;
+        }
+
         const response = await fetch(`https://api.notion.com/v1/databases/${dbId}`, {
             method: 'GET',
             headers: {
@@ -1111,14 +1134,14 @@ async function testNotionConnection() {
         if (response.ok) {
             const data = await response.json();
             const dbTitle = data.title?.[0]?.plain_text || 'Database';
-            resultEl.innerHTML = `✅ Connected: "${escapeHtml(dbTitle)}"`;
+            resultEl.innerHTML = `✅ Connected: "${escapeHtml(dbTitle)}" (${escapeHtml(botName)})`;
             resultEl.style.color = 'var(--success)';
             log(`Notion connection successful: ${dbTitle}`, 'success');
         } else {
-            const error = await response.json();
-            resultEl.innerHTML = `❌ ${escapeHtml(error.message || 'Connection failed')}`;
+            const error = await response.json().catch(() => ({}));
+            resultEl.innerHTML = `❌ Database access failed: ${escapeHtml(error.message || 'Make sure database is shared with connection')}`;
             resultEl.style.color = 'var(--error)';
-            log(`Notion connection failed: ${error.message}`, 'error');
+            log(`Notion database test failed: ${error.message}`, 'error');
         }
     } catch (err) {
         resultEl.innerHTML = `❌ ${escapeHtml(err.message)}`;
@@ -2302,12 +2325,15 @@ function isValidNotionDatabaseId(id) {
 
 // Log utility
 function log(message, type = 'info') {
-    const container = document.getElementById('logContent');
-    if (!container) {
-        console.log(`[${type}] ${message}`);
-        return;
+    if (typeof Toast !== 'undefined') {
+        if (type === 'error') Toast.error(message);
+        else if (type === 'success') Toast.success(message);
+        else if (type === 'warn' || type === 'warning') Toast.warning(message);
+        else Toast.info(message);
     }
-
+    console.log(`[${type}] ${message}`);
+    const container = document.getElementById('logContent');
+    if (!container) return;
     const item = document.createElement('div');
     item.className = `log-item log-${type}`;
     const time = new Date().toLocaleTimeString();
