@@ -30,6 +30,6 @@ ALLOWED_ORIGINS = ""
 # The worker falls back to per-isolate in-memory tracking if this binding is missing,
 # so you can deploy and test before creating the KV namespace.
 # ───────────────────────────────────────────────────────────────────────────────
-# [[kv_namespaces]]
-# binding = "RATE_LIMIT_KV"
-# id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
+[[kv_namespaces]]
+binding = "RATE_LIMIT_KV"
+id = "660e3c086e50420ea49b1323029b9210"

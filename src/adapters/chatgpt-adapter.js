@@ -493,6 +493,16 @@ function transformChatGPTData(data) {
                 return `\n> 📝 ${msg.content.text}\n`;
             }
 
+            // Handle Canvas / TextDocs (side-panel documents & code edits)
+            if (contentType === 'textdoc' || msg.recipient === 'dalle.textdoc' || msg.metadata?.textdoc_type) {
+                const docType = msg.metadata?.textdoc_type || msg.content?.textdoc_type || 'document';
+                const lang = docType.includes('code') ? docType.split('/')[1] || 'text' : '';
+                const docContent = msg.content?.text || msg.content?.content || '';
+                if (docContent) {
+                    return `\n> 📄 **Canvas: ${docType}**\n\`\`\`${lang}\n${docContent}\n\`\`\`\n`;
+                }
+            }
+
             // Multimodal text content (text mixed with images/files)
             if (contentType === 'multimodal_text' && msg.content?.parts) {
                 const parts = [];

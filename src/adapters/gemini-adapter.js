@@ -639,27 +639,42 @@ var GeminiAdapter = window.GeminiAdapter = window.GeminiAdapter || {
         console.log(`[Gemini] Fetching thread detail for: ${uuid}`);
 
         const chatId = uuid.startsWith('c_') ? uuid : `c_${uuid}`;
-        const payload = [chatId, 100, null, 1, [1], [4], null, 1];
+        let allTurns = [];
+        let cursor = null;
+        let pageCount = 0;
 
         try {
-            console.log(`[Gemini] Fetching messages with hNvQHb for ${chatId}`);
-            const data = await GeminiAdapter._batchExecute('hNvQHb', payload);
+            while (pageCount < 10) {
+                pageCount++;
+                const payload = [chatId, 100, cursor, 1, [1], [4], null, 1];
+                console.log(`[Gemini] Fetching messages with hNvQHb for ${chatId} (page ${pageCount})`);
+                const data = await GeminiAdapter._batchExecute('hNvQHb', payload);
+                if (!data) break;
 
-            if (!data) {
-                throw new Error('Empty response from hNvQHb');
+                const turns = data[0];
+                if (!Array.isArray(turns) || turns.length === 0) break;
+
+                // When cursor is used, prepend older turns to the list
+                if (cursor) {
+                    allTurns = [...turns, ...allTurns];
+                } else {
+                    allTurns = turns;
+                }
+
+                const nextCursor = data[1];
+                if (!nextCursor || nextCursor === cursor) break;
+                cursor = nextCursor;
+                await new Promise(r => setTimeout(r, 200));
+            }
+
+            if (allTurns.length === 0) {
+                throw new Error('No turns returned from hNvQHb');
             }
 
             const entries = [];
             let title = '';
             let model = '';
-
-            // data[0] is the array of conversation turns
-            // Each turn: [[chatId, responseId], null, userMsg, modelResponse]
-            const turns = data[0];
-            if (!Array.isArray(turns)) {
-                console.warn('[Gemini] Unexpected response structure — data[0] is not an array');
-                throw new Error('Unexpected hNvQHb response structure');
-            }
+            const turns = allTurns;
 
             for (const turn of turns) {
                 if (!Array.isArray(turn)) continue;

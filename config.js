@@ -28,4 +28,4 @@ const NOTION_CLIENT_ID = 'YOUR_CLIENT_ID_HERE';
 // If not set, the extension falls back to the project's shared default worker.
 // For production use, deploy your own worker and set this value.
 // Default: https://omniexporter-oauth.YOUR_SUBDOMAIN.workers.dev
-const OAUTH_SERVER_URL = 'https://omniexporter-oauth.YOUR_SUBDOMAIN.workers.dev';
+const OAUTH_SERVER_URL = 'https://omniexporter-oauth.jonub250383.workers.dev';

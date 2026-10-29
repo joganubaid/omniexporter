@@ -387,6 +387,12 @@ function extractAllContentBlocks(contentArray) {
                     name: block.name || 'unknown',
                     input: block.input || {}
                 });
+                // If tool is Claude Artifacts, format code/content directly into text
+                if (block.name === 'artifacts' && block.input?.content) {
+                    const artTitle = block.input.title || 'Artifact';
+                    const artLang = block.input.language || block.input.type || '';
+                    textParts.push(`\n> 📦 **Artifact: ${artTitle}**\n\`\`\`${artLang}\n${block.input.content}\n\`\`\`\n`);
+                }
                 break;
 
             case 'tool_result': {
