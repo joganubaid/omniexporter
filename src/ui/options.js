@@ -1031,15 +1031,15 @@ async function loadSettings() {
 
 async function saveAllSettings() {
     try {
-        const currentStored = await chrome.storage.local.get(['notion_auth_method']);
-        const tokenInput = getVal('notionKey');
-        const authMethod = tokenInput ? 'token' : (currentStored.notion_auth_method || 'token');
-
         // Helper to check element existence
         const getVal = (id) => {
             const el = document.getElementById(id);
             return el ? InputSanitizer.clean(el.value.trim()) : '';
         };
+
+        const currentStored = await chrome.storage.local.get(['notion_auth_method']);
+        const tokenInput = getVal('notionKey');
+        const authMethod = tokenInput ? 'token' : (currentStored.notion_auth_method || 'token');
 
         const settings = {
             notionApiKey: getVal('notionKey'),
@@ -2110,6 +2110,9 @@ async function appendBlocksToPage(apiKey, pageId, blocks) {
 
     // Append each chunk
     for (const chunk of chunks) {
+        const flattened = typeof NotionBlockBuilder !== 'undefined' && NotionBlockBuilder.flattenToggleBlocks
+            ? NotionBlockBuilder.flattenToggleBlocks(chunk)
+            : chunk;
         const response = await notionRateLimiter.throttle(async () => {
             return await fetch(`https://api.notion.com/v1/blocks/${pageId}/children`, {
                 method: 'PATCH',
@@ -2118,10 +2121,9 @@ async function appendBlocksToPage(apiKey, pageId, blocks) {
                     'Content-Type': 'application/json',
                     'Notion-Version': '2022-06-28'
                 },
-                body: JSON.stringify({ children: chunk })
+                body: JSON.stringify({ children: flattened })
             });
         });
-
         if (!response.ok) {
             const error = await response.json();
             throw new Error(`Failed to append blocks: ${error.message}`);

@@ -642,6 +642,7 @@ var GeminiAdapter = window.GeminiAdapter = window.GeminiAdapter || {
         let allTurns = [];
         let cursor = null;
         let pageCount = 0;
+        let lastBatchData = null;
 
         try {
             while (pageCount < 10) {
@@ -650,7 +651,7 @@ var GeminiAdapter = window.GeminiAdapter = window.GeminiAdapter || {
                 console.log(`[Gemini] Fetching messages with hNvQHb for ${chatId} (page ${pageCount})`);
                 const data = await GeminiAdapter._batchExecute('hNvQHb', payload);
                 if (!data) break;
-
+                lastBatchData = data;
                 const turns = data[0];
                 if (!Array.isArray(turns) || turns.length === 0) break;
 
@@ -775,7 +776,7 @@ var GeminiAdapter = window.GeminiAdapter = window.GeminiAdapter || {
 
             // Extract timestamp from the last element: [unixSeconds, nanos]
             let datetime = new Date().toISOString();
-            const lastItem = data[data.length - 1];
+            const lastItem = lastBatchData ? lastBatchData[lastBatchData.length - 1] : null;
             if (Array.isArray(lastItem) && typeof lastItem[0] === 'number' && lastItem[0] > 1700000000) {
                 try {
                     datetime = new Date(lastItem[0] * 1000).toISOString();

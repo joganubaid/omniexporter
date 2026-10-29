@@ -677,7 +677,8 @@ function buildNotionBlocks(entries, platform, metadata) {
                 }
 
                 // Answer text
-                var answer = stripHtml(block.markdown_block && block.markdown_block.answer || '');
+                var rawAns = (block.markdown_block && (block.markdown_block.answer || (Array.isArray(block.markdown_block.chunks) ? block.markdown_block.chunks.join('\n') : ''))) || '';
+                var answer = stripHtml(rawAns);
                 if (answer.trim()) {
                     var parsedBlocks = markdownToBlocks(answer.trim());
                     for (var pi = 0; pi < parsedBlocks.length; pi++) {
@@ -712,6 +713,15 @@ function buildNotionBlocks(entries, platform, metadata) {
                         children.push(bulletedListItem(c.title || c.url));
                     }
                 });
+            }
+        } else {
+            var fallbackAns = stripHtml(entry.answer || entry.text || '');
+            if (fallbackAns.trim()) {
+                children.push(headingBlock(3, 'Assistant'));
+                var parsedFallback = markdownToBlocks(fallbackAns.trim());
+                for (var fbi = 0; fbi < parsedFallback.length; fbi++) {
+                    children.push(parsedFallback[fbi]);
+                }
             }
         }
 

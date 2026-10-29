@@ -539,8 +539,8 @@ async function performAutoSync() {
             }
 
             if (newThreads.length === 0) {
+                totalThreads += threads.length;
                 await updateSyncCheckpoint(platform, Date.now(), null);
-                await recordSyncJob(threads.length, 0, 0, 0);
                 continue;
             }
 
@@ -859,10 +859,14 @@ async function syncToNotion(data, settings) {
                 const rawDate = data.detail?.last_query_datetime
                     || data.detail?.entries?.[0]?.created_datetime
                     || data.detail?.entries?.[0]?.last_query_datetime;
-                const chatDate = rawDate
-                    ? new Date(rawDate).toISOString().split('T')[0]
-                    : new Date().toISOString().split('T')[0];
-                properties['Chat Time'] = { date: { start: chatDate } };
+                try {
+                    const chatDate = rawDate
+                        ? new Date(rawDate).toISOString().split('T')[0]
+                        : new Date().toISOString().split('T')[0];
+                    properties['Chat Time'] = { date: { start: chatDate } };
+                } catch (_) {
+                    properties['Chat Time'] = { date: { start: new Date().toISOString().split('T')[0] } };
+                }
             }
             if (dbSchema.properties['Exported']?.type === 'date')
                 properties['Exported'] = { date: { start: new Date().toISOString().split('T')[0] } };

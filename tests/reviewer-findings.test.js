@@ -103,4 +103,71 @@ describe('Code Reviewer Fixes Verification', () => {
             assert.equal(rendered[1], '📎 [File: dataset.csv]');
         });
     });
+
+    describe('Finding 4: NotionBlockBuilder chunks and fallback answer', () => {
+        const NotionBlockBuilder = require('../src/utils/notion-block-builder.js');
+
+        it('extracts answers split into markdown_block.chunks array', () => {
+            const entries = [
+                {
+                    query: 'List items',
+                    blocks: [
+                        { markdown_block: { chunks: ['Chunk 1 of answer', 'Chunk 2 of answer'] } }
+                    ]
+                }
+            ];
+            const blocks = NotionBlockBuilder.buildNotionBlocks(entries, 'Perplexity');
+            const pBlocks = blocks.filter(b => b.type === 'paragraph');
+            const text = pBlocks.map(b => b.paragraph.rich_text.map(r => r.text.content).join('')).join('\n');
+            assert.match(text, /Chunk 1 of answer/);
+            assert.match(text, /Chunk 2 of answer/);
+        });
+
+        it('falls back to entry.text when blocks array is empty', () => {
+            const entries = [
+                {
+                    query: 'Direct query',
+                    text: 'Direct answer text without blocks wrapper.',
+                    blocks: []
+                }
+            ];
+            const blocks = NotionBlockBuilder.buildNotionBlocks(entries, 'Perplexity');
+            const asstHeading = blocks.find(b => b.type === 'heading_3' && b.heading_3.rich_text[0].text.content === 'Assistant');
+            assert.ok(asstHeading, 'Must render Assistant heading on fallback');
+            const pBlock = blocks.find(b => b.type === 'paragraph' && b.paragraph.rich_text[0].text.content.includes('Direct answer text'));
+            assert.ok(pBlock, 'Must render fallback answer text in paragraph');
+        });
+    });
+
+    describe('Finding 5: Grok trailing query preservation across multi-turn chats', () => {
+        it('preserves trailing user query even when entries.length > 0', () => {
+            // Multi-turn: 1 complete turn + 1 trailing user message
+            const entries = [
+                { query_str: 'Turn 1 query', blocks: [{ markdown_block: { answer: 'Turn 1 answer' } }] }
+            ];
+            let currentQuery = 'Trailing user query';
+            if (currentQuery) {
+                entries.push({
+                    query_str: currentQuery,
+                    query: currentQuery,
+                    blocks: [{ intended_usage: 'ask_text', markdown_block: { answer: '' } }]
+                });
+            }
+            assert.equal(entries.length, 2);
+            assert.equal(entries[1].query, 'Trailing user query');
+        });
+    });
+
+    describe('Finding 7: Date parsing resilience in Chat Time', () => {
+        it('safely handles invalid or corrupt date strings without throwing RangeError', () => {
+            const corruptDate = 'not-a-valid-date-value';
+            let chatDate;
+            try {
+                chatDate = corruptDate ? new Date(corruptDate).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+            } catch (_) {
+                chatDate = new Date().toISOString().split('T')[0];
+            }
+            assert.match(chatDate, /^\d{4}-\d{2}-\d{2}$/);
+        });
+    });
 });

@@ -489,7 +489,10 @@ async function syncToNotionAPI(data, apiKey, dbId) {
             'Notion-Version': '2022-06-28'
         };
         for (let i = 100; i < children.length; i += 100) {
-            const batch = children.slice(i, i + 100);
+            const rawBatch = children.slice(i, i + 100);
+            const batch = typeof NotionBlockBuilder !== 'undefined' && NotionBlockBuilder.flattenToggleBlocks
+                ? NotionBlockBuilder.flattenToggleBlocks(rawBatch)
+                : rawBatch;
             try {
                 // Use withRetry + rateLimiter (same as the initial POST) so 429s are handled
                 // instead of silently dropping blocks.

@@ -420,7 +420,7 @@ var GrokAdapter = window.GrokAdapter = window.GrokAdapter || {
             });
 
             // Handle trailing user message with no assistant response
-            if (currentQuery && entries.length === 0) {
+            if (currentQuery) {
                 entries.push({
                     query_str: currentQuery,
                     query: currentQuery,
