@@ -65,7 +65,8 @@
                 "src/platform-config.js",
                 "src/adapters/perplexity-adapter.js",
                 "src/content.js"
-            ]
+            ],
+            "run_at": "document_idle"
         },
         {
             "matches": [
@@ -79,7 +80,8 @@
                 "src/platform-config.js",
                 "src/adapters/chatgpt-adapter.js",
                 "src/content.js"
-            ]
+            ],
+            "run_at": "document_idle"
         },
         {
             "matches": [
@@ -92,7 +94,8 @@
                 "src/platform-config.js",
                 "src/adapters/claude-adapter.js",
                 "src/content.js"
-            ]
+            ],
+            "run_at": "document_idle"
         },
         {
             "matches": [

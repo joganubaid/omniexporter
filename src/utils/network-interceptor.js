@@ -76,12 +76,26 @@ var NetworkInterceptor = window.NetworkInterceptor = window.NetworkInterceptor |
 
         XMLHttpRequest.prototype.send = function () {
             try {
+                const urlStr = String(this._interceptedUrl || '');
+                if (
+                    urlStr.includes('telemetry') ||
+                    urlStr.includes('intake') ||
+                    urlStr.includes('sentry') ||
+                    urlStr.includes('statsig') ||
+                    urlStr.includes('analytics') ||
+                    urlStr.includes('datadog')
+                ) {
+                    return originalSend.apply(this, arguments);
+                }
+
                 // Ensure we only attach a single 'load' listener per XHR instance
                 if (!interceptedInstances.has(this)) {
                     interceptedInstances.add(this);
                     this.addEventListener('load', function () {
                         try {
-                            self.processResponse(this._interceptedUrl, this.responseText, this._interceptedMethod);
+                            if (this.status >= 200 && this.status < 300) {
+                                self.processResponse(this._interceptedUrl, this.responseText, this._interceptedMethod);
+                            }
                         } catch (e) {
                             console.debug('[NetworkInterceptor] processResponse threw:', e.message);
                         }
@@ -106,29 +120,44 @@ var NetworkInterceptor = window.NetworkInterceptor = window.NetworkInterceptor |
         window.fetch = new Proxy(originalFetch, {
             apply(target, thisArg, args) {
                 const [url, options = {}] = args;
-                let response;
+                const urlStr = typeof url === 'string' ? url : url?.url || '';
+
+                // Ignore telemetry, analytics, beacons, and Datadog calls completely
+                if (
+                    urlStr.includes('telemetry') ||
+                    urlStr.includes('intake') ||
+                    urlStr.includes('sentry') ||
+                    urlStr.includes('statsig') ||
+                    urlStr.includes('datadog') ||
+                    urlStr.includes('analytics') ||
+                    urlStr.includes('/ces/v1/')
+                ) {
+                    return Reflect.apply(target, thisArg, args);
+                }
+
                 const result = Reflect.apply(target, thisArg, args);
 
                 result.then(resp => {
-                    // Clone response to read it WITHOUT blocking the original
+                    // Only clone successful responses that could be JSON
+                    if (!resp || !resp.ok) return;
+                    const ctype = resp.headers?.get('content-type') || '';
+                    if (ctype && !ctype.includes('json') && !ctype.includes('text') && !ctype.includes('javascript')) {
+                        return;
+                    }
+
                     try {
                         const clone = resp.clone();
-                        // Read in background, don't await
                         clone.text().then(text => {
                             try {
-                                self.processResponse(url.toString(), text, (options && options.method) || 'GET');
+                                self.processResponse(urlStr, text, (options && options.method) || 'GET');
                             } catch (e) {
                                 console.debug('[NetworkInterceptor] fetch processResponse threw:', e.message);
                             }
-                        }).catch(e => console.debug('[NetworkInterceptor] fetch clone.text() rejected:', e?.message));
+                        }).catch(() => {});
                     } catch (e) {
                         console.debug('[NetworkInterceptor] fetch resp.clone() failed:', e.message);
                     }
-                }).catch(() => {
-                    // Original fetch rejected — caller's own .catch() will see it.
-                    // We intentionally don't log here because the caller is the
-                    // right place to react.
-                });
+                }).catch(() => {});
 
                 return result;
             }
