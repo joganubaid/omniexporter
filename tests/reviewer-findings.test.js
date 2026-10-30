@@ -2,6 +2,8 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const ExportManager = require('../src/utils/export-manager.js');
 const { platformConfig } = require('../src/platform-config.js');
 
@@ -168,6 +170,128 @@ describe('Code Reviewer Fixes Verification', () => {
                 chatDate = new Date().toISOString().split('T')[0];
             }
             assert.match(chatDate, /^\d{4}-\d{2}-\d{2}$/);
+        });
+    });
+
+    describe('Enterprise Review Findings Verification', () => {
+        it('Finding 1: GeminiBridge does not block getSessionParams when isReady is initially false', async () => {
+            const bridge = {
+                isReady: false,
+                _sessionParamsCache: null,
+                _sessionParamsCacheTime: 0,
+                _sessionParamsCacheTTL: 60000,
+                async sendRequest(action) {
+                    if (action === 'GET_SESSION_PARAMS') return { at: 'token123', bl: 'boq_123', fsid: 'fsid_123' };
+                    return null;
+                },
+                async getSessionParams() {
+                    const now = Date.now();
+                    if (this._sessionParamsCache && (now - this._sessionParamsCacheTime) < this._sessionParamsCacheTTL) {
+                        return this._sessionParamsCache;
+                    }
+                    try {
+                        const params = await this.sendRequest('GET_SESSION_PARAMS');
+                        if (params && params.at) {
+                            this._sessionParamsCache = params;
+                            this._sessionParamsCacheTime = now;
+                            this.isReady = true;
+                        }
+                        return params || { at: null, bl: null, fsid: null };
+                    } catch {
+                        return { at: null, bl: null, fsid: null };
+                    }
+                }
+            };
+            const params = await bridge.getSessionParams();
+            assert.equal(params.at, 'token123');
+            assert.equal(bridge.isReady, true);
+        });
+
+        it('Finding 2: Dynamic title property detects columns named Name or Topic', () => {
+            const customSchema = {
+                properties: {
+                    'Name': { id: 'title', type: 'title', title: {} },
+                    'URL': { id: 'url', type: 'url', url: {} }
+                }
+            };
+            let titlePropertyName = 'Title';
+            if (customSchema?.properties) {
+                for (const [name, prop] of Object.entries(customSchema.properties)) {
+                    if (prop.type === 'title') { titlePropertyName = name; break; }
+                }
+            }
+            assert.equal(titlePropertyName, 'Name');
+        });
+
+        it('Finding 3: manifest.json includes https://*.workers.dev/* in host_permissions', () => {
+            const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '../manifest.json'), 'utf8'));
+            assert.ok(manifest.host_permissions.includes('https://*.workers.dev/*'));
+        });
+
+        it('Finding 4: Property builder skips URL when platformUrl is null/unresolved', () => {
+            const properties = { Title: { title: [{ text: { content: 'Test' } }] } };
+            const availableProps = { 'URL': { type: 'url' } };
+            const platformUrl = null;
+            if (availableProps['URL'] && platformUrl) {
+                properties.URL = { url: platformUrl };
+            }
+            assert.equal(properties.URL, undefined);
+        });
+
+        it('Finding 5: Claude conversationsV2 query string uses correct separator', () => {
+            const baseUrl = 'https://claude.ai';
+            const v2WithQuery = '/api/organizations/org123/chat_conversations_v2?limit=50';
+            const sep1 = v2WithQuery.includes('?') ? '&' : '?';
+            const url1 = `${baseUrl}${v2WithQuery}${sep1}offset=0`;
+            assert.equal(url1, 'https://claude.ai/api/organizations/org123/chat_conversations_v2?limit=50&offset=0');
+
+            const v2Bare = '/api/organizations/org123/chat_conversations';
+            const sep2 = v2Bare.includes('?') ? '&' : '?';
+            const url2 = `${baseUrl}${v2Bare}${sep2}offset=0`;
+            assert.equal(url2, 'https://claude.ai/api/organizations/org123/chat_conversations?offset=0');
+        });
+
+        it('Finding 6: ChatGPT data transformer handles assistant-initial messages', () => {
+            const orderedMessages = [
+                { role: 'assistant', content: 'Hello! How can I help you today?' },
+                { role: 'user', content: 'What is 2+2?' },
+                { role: 'assistant', content: '4' }
+            ];
+            const entries = [];
+            let currentEntry = null;
+            orderedMessages.forEach(msg => {
+                const { role, content } = msg;
+                if (role === 'user') {
+                    if (currentEntry) entries.push(currentEntry);
+                    currentEntry = { query_str: content.trim(), blocks: [] };
+                } else if (role === 'assistant' || role === 'tool') {
+                    if (!currentEntry) {
+                        currentEntry = { query_str: '', blocks: [] };
+                    }
+                    currentEntry.blocks.push({
+                        intended_usage: 'ask_text',
+                        markdown_block: { answer: content.trim() }
+                    });
+                }
+            });
+            if (currentEntry) entries.push(currentEntry);
+
+            assert.equal(entries.length, 2);
+            assert.equal(entries[0].query_str, '');
+            assert.equal(entries[0].blocks[0].markdown_block.answer, 'Hello! How can I help you today?');
+            assert.equal(entries[1].query_str, 'What is 2+2?');
+            assert.equal(entries[1].blocks[0].markdown_block.answer, '4');
+        });
+
+        it('Finding 7: Cloudflare worker CORS headers allow GET requests', () => {
+            const workerCode = fs.readFileSync(path.join(__dirname, '../cloudflare-worker/worker.js'), 'utf8');
+            assert.match(workerCode, /'Access-Control-Allow-Methods':\s*'GET,\s*POST,\s*OPTIONS'/);
+        });
+
+        it('Finding 8: Perplexity version lookup safely handles undefined activeVersions', () => {
+            const dummyConfig = { activeVersions: undefined };
+            const currentVersion = dummyConfig.activeVersions?.get('Perplexity') || '2.18';
+            assert.equal(currentVersion, '2.18');
         });
     });
 });

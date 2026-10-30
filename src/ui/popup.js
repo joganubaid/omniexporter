@@ -704,17 +704,37 @@ async function getNotionDatabaseSchema(dbId, apiKey) {
 }
 
 async function buildNotionProperties(data, dbId, apiKey, entries = []) {
-    // Bug 3 fix: key must be 'Title' (capital T) to match auto-created DB schema
-    const properties = {
-        'Title': { title: [{ type: "text", text: { content: (data.title || 'Chat').slice(0, 2000) } }] }
-    };
+    let schema = null;
     try {
-        const schema = await getNotionDatabaseSchema(dbId, apiKey);
+        schema = await getNotionDatabaseSchema(dbId, apiKey);
+    } catch (e) {
+        console.warn('[Popup] Schema fetch failed, using defaults:', e.message);
+    }
+
+    let titlePropertyName = 'Title';
+    if (schema?.properties) {
+        for (const [name, prop] of Object.entries(schema.properties)) {
+            if (prop.type === 'title') { titlePropertyName = name; break; }
+        }
+    }
+
+    const properties = {
+        [titlePropertyName]: {
+            title: [{
+                type: "text",
+                text: { content: (data.title || 'Chat').slice(0, 2000) }
+            }]
+        }
+    };
+
+    try {
         if (!schema || !schema.properties) return properties;
         const availableProps = schema.properties;
         if (availableProps['URL'] && data.uuid) {
-            // Bug 2/7 fix: use platform-aware URL via shared helper
-            properties.URL = { url: getPlatformUrl(currentPlatform, data.uuid) };
+            const platformUrl = getPlatformUrl(currentPlatform, data.uuid);
+            if (platformUrl) {
+                properties.URL = { url: platformUrl };
+            }
         }
         const threadTime = (entries && entries[0]) ? (entries[0].updated_datetime || entries[0].created_datetime) : null;
         if (availableProps['Chat Time'] && threadTime) {

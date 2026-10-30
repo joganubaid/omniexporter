@@ -634,8 +634,9 @@ async function handleGetThreadListOffset(adapter, payload, sendResponse) {
                 const orgId   = await ClaudeAdapter.getOrgId();
                 const baseUrl = platformConfig.getBaseUrl('Claude');
                 const v2Ep    = platformConfig.buildEndpoint('Claude', 'conversationsV2', { org: orgId });
-                // V2 uses &offset=N (not cursor=uuid — that returns same page forever)
-                const url = `${baseUrl}${v2Ep}&offset=${offset}`;
+                // V2 uses offset=N (not cursor=uuid — that returns same page forever)
+                const sep     = v2Ep.includes('?') ? '&' : '?';
+                const url     = `${baseUrl}${v2Ep}${sep}offset=${offset}`;
 
                 const resp = await ClaudeAdapter._fetchWithRetry(url);
                 const data = await resp.json();

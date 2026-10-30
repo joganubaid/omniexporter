@@ -567,7 +567,10 @@ function transformChatGPTData(data) {
                     query_str: content.trim(),
                     blocks: []
                 };
-            } else if ((role === 'assistant' || role === 'tool') && currentEntry) {
+            } else if (role === 'assistant' || role === 'tool') {
+                if (!currentEntry) {
+                    currentEntry = { query_str: '', blocks: [] };
+                }
                 currentEntry.blocks.push({
                     intended_usage: 'ask_text',
                     markdown_block: { answer: content.trim() }

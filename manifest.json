@@ -42,7 +42,8 @@
         "https://gemini.google.com/*",
         "https://grok.com/*",
         "https://x.com/*",
-        "https://chat.deepseek.com/*"
+        "https://chat.deepseek.com/*",
+        "https://*.workers.dev/*"
     ],
     "action": {
         "default_popup": "src/ui/popup.html",

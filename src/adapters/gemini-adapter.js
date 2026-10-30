@@ -91,9 +91,9 @@ var GeminiBridge = window.GeminiBridge = window.GeminiBridge || {
 
     // Get auth token from page context
     async getAuthToken() {
-        if (!this.isReady) return null;
         try {
             const result = await this.sendRequest('GET_AUTH_TOKEN');
+            if (result?.token) this.isReady = true;
             return result?.token || null;
         } catch {
             return null;
@@ -109,16 +109,12 @@ var GeminiBridge = window.GeminiBridge = window.GeminiBridge || {
             return this._sessionParamsCache;
         }
 
-        if (!this.isReady) {
-            console.warn('[Gemini] Bridge not ready, cannot get session params');
-            return { at: null, bl: null, fsid: null };
-        }
-
         try {
             const params = await this.sendRequest('GET_SESSION_PARAMS');
             if (params && params.at) {
                 this._sessionParamsCache = params;
                 this._sessionParamsCacheTime = now;
+                this.isReady = true;
                 console.log('[Gemini] Session params acquired:', {
                     at: '✓',
                     bl: params.bl || '✗',
@@ -134,9 +130,10 @@ var GeminiBridge = window.GeminiBridge = window.GeminiBridge || {
 
     // Get global data from page context  
     async getGlobalData() {
-        if (!this.isReady) return null;
         try {
-            return await this.sendRequest('GET_GLOBAL_DATA');
+            const data = await this.sendRequest('GET_GLOBAL_DATA');
+            if (data?.exists) this.isReady = true;
+            return data;
         } catch {
             return null;
         }

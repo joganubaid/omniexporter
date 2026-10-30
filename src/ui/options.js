@@ -2309,9 +2309,22 @@ async function getNotionDatabaseSchema(dbId, apiKey) {
  * Dynamically builds Notion properties based on available columns
  */
 async function buildNotionProperties(data, dbId, apiKey, entries = []) {
-    // Bug 3 fix: key must be 'Title' (capital T) to match auto-created DB schema by notion-oauth.js
+    let schema = null;
+    try {
+        schema = await getNotionDatabaseSchema(dbId, apiKey);
+    } catch (e) {
+        console.warn('[OmniExporter] Schema fetch failed, using defaults:', e.message);
+    }
+
+    let titlePropertyName = 'Title';
+    if (schema?.properties) {
+        for (const [name, prop] of Object.entries(schema.properties)) {
+            if (prop.type === 'title') { titlePropertyName = name; break; }
+        }
+    }
+
     const properties = {
-        'Title': {
+        [titlePropertyName]: {
             title: [{
                 type: "text",
                 text: { content: (data.title || 'Untitled Chat').slice(0, 2000) }
@@ -2320,14 +2333,15 @@ async function buildNotionProperties(data, dbId, apiKey, entries = []) {
     };
 
     try {
-        const schema = await getNotionDatabaseSchema(dbId, apiKey);
         if (!schema || !schema.properties) return properties;
-
         const availableProps = schema.properties;
 
-        // URL column — Bug 6 fix: use platform-aware URL instead of hardcoded Perplexity
+        // URL column
         if (availableProps['URL'] && data.uuid) {
-            properties.URL = { url: getPlatformUrl(currentPlatform, data.uuid) };
+            const platformUrl = getPlatformUrl(currentPlatform, data.uuid);
+            if (platformUrl) {
+                properties.URL = { url: platformUrl };
+            }
         }
 
         // Chat Time column

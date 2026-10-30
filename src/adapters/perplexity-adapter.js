@@ -308,7 +308,7 @@ async function fetchPerplexityDetailResilient(uuid) {
         while (true) {
             pageCount++;
             if (pageCount > MAX_PAGES) { console.warn('[Perplexity] Reached max page limit, stopping'); break; }
-            const currentVersion = platformConfig.activeVersions.get('Perplexity') || '2.18';
+            const currentVersion = platformConfig.activeVersions?.get('Perplexity') || '2.18';
             const baseUrl = platformConfig.getBaseUrl('Perplexity');
             const params = new URLSearchParams({
                 with_parent_info: "true", with_schematized_response: "true",
