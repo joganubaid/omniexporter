@@ -55,4 +55,32 @@ describe('manifest.json', () => {
             }
         }
     });
+
+    it('ensures all HTML files strictly comply with MV3 Content Security Policy', () => {
+        const htmlFiles = [
+            'src/ui/popup.html',
+            'src/ui/options.html',
+            'auth/callback.html'
+        ];
+
+        for (const relHtml of htmlFiles) {
+            const fullPath = path.join(ROOT_DIR, relHtml);
+            if (!fs.existsSync(fullPath)) continue;
+            const content = fs.readFileSync(fullPath, 'utf8');
+
+            // 1. No inline event handlers (onerror=, onclick=, onload=, etc.)
+            const inlineHandlers = [...content.matchAll(/\s(on[a-zA-Z]+)=["'][^"']*["']/g)].map(m => m[1]);
+            assert.deepEqual(inlineHandlers, [], `${relHtml} has inline event handlers which violate MV3 CSP`);
+
+            // 2. No inline script tags without src
+            const inlineScripts = [...content.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/gi)]
+                .map(m => m[1].trim())
+                .filter(s => s.length > 0);
+            assert.deepEqual(inlineScripts, [], `${relHtml} has inline script blocks which violate MV3 CSP`);
+
+            // 3. No javascript: pseudo-protocol
+            const jsUrls = [...content.matchAll(/href=["'](javascript:[^"']*)["']/gi)].map(m => m[1]);
+            assert.deepEqual(jsUrls, [], `${relHtml} has javascript: URLs which violate MV3 CSP`);
+        }
+    });
 });

@@ -1173,7 +1173,7 @@ async function testNotionConnection() {
         log(`Notion test error: ${err.message}`, 'error');
     } finally {
         btnEl.disabled = false;
-        btnEl.textContent = '🔌 Test Connection';
+        btnEl.textContent = 'Test & Save Connection';
     }
 }
 

@@ -53,45 +53,6 @@
         <p id="status">Processing authorization...</p>
     </div>
 
-    <script>
-        // This page is loaded in the OAuth redirect
-        // It processes the authorization response
-        (async function() {
-            try {
-                const urlParams = new URLSearchParams(window.location.search);
-                const code = urlParams.get('code');
-                const error = urlParams.get('error');
-                const errorDescription = urlParams.get('error_description');
-
-                const statusEl = document.getElementById('status');
-
-                if (error) {
-                    statusEl.textContent = `Error: ${errorDescription || error}`;
-                    setTimeout(() => window.close(), 3000);
-                    return;
-                }
-
-                if (code) {
-                    statusEl.textContent = 'Authorization successful! Completing setup...';
-                    
-                    // The chrome.identity.launchWebAuthFlow will capture this URL
-                    // and pass it back to the extension
-                    // No further action needed here
-                    
-                    setTimeout(() => {
-                        statusEl.textContent = 'You can close this window';
-                        window.close();
-                    }, 2000);
-                } else {
-                    statusEl.textContent = 'No authorization code received';
-                    setTimeout(() => window.close(), 3000);
-                }
-            } catch (error) {
-                console.error('OAuth callback error:', error);
-                document.getElementById('status').textContent = 'An error occurred';
-                setTimeout(() => window.close(), 3000);
-            }
-        })();
-    </script>
+    <script src="callback.js"></script>
 </body>
 </html>

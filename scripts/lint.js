@@ -139,12 +139,39 @@ for (const relHtml of htmlFiles) {
         }
     }
 }
+// 4. Enforce MV3 Content Security Policy rules on HTML files
+console.log('4. Checking Content Security Policy compliance in HTML files...');
+for (const relHtml of htmlFiles) {
+    const fullHtmlPath = path.join(ROOT_DIR, relHtml);
+    if (!fs.existsSync(fullHtmlPath)) continue;
+    const content = fs.readFileSync(fullHtmlPath, 'utf8');
+
+    // Check for inline event handlers (onclick=, onerror=, onload=, etc.)
+    const inlineHandlerMatches = content.matchAll(/\s(on[a-zA-Z]+)=["'][^"']*["']/g);
+    for (const match of inlineHandlerMatches) {
+        logError(`${relHtml}: inline event handler "${match[1]}" violates MV3 CSP ('script-src 'self''). Use addEventListener instead.`);
+    }
+
+    // Check for inline scripts (<script> without src)
+    const inlineScriptMatches = content.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/gi);
+    for (const match of inlineScriptMatches) {
+        const scriptBody = match[1].trim();
+        if (scriptBody.length > 0) {
+            logError(`${relHtml}: inline <script> block violates MV3 CSP ('script-src 'self''). Move script code into an external .js file.`);
+        }
+    }
+
+    // Check for javascript: URLs
+    const jsUrlMatches = content.matchAll(/href=["'](javascript:[^"']*)["']/gi);
+    for (const match of jsUrlMatches) {
+        logError(`${relHtml}: javascript: URL "${match[1]}" violates MV3 CSP.`);
+    }
+}
 
 if (errors === 0) {
-    logOk('All HTML script and stylesheet references are valid');
+    logOk('All HTML files comply with Manifest V3 Content Security Policy (no inline handlers or scripts)');
     console.log('\n\x1b[32m✔ Linter passed with 0 errors.\x1b[0m\n');
     process.exit(0);
 } else {
-    console.error(`\n\x1b[31m✖ Linter failed with ${errors} error(s).\x1b[0m\n`);
     process.exit(1);
 }

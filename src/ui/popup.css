@@ -199,16 +199,16 @@ button {
 }
 
 .btn-notion {
-  background: var(--bg-card);
-  color: var(--text);
-  border: 1px solid var(--border);
+  background: #242320;
+  color: #FFFFFF;
+  border: 1px solid #3D3C36;
   padding: 9px 14px;
 }
 
 .btn-notion:hover:not(:disabled) {
-  background: var(--bg-hover);
-  border-color: var(--border-hi);
-  color: var(--text);
+  background: #33312C;
+  border-color: #55524B;
+  color: #FFFFFF;
 }
 
 .btn-dashboard {

@@ -177,13 +177,26 @@ async function detectPlatform() {
             return;
         }
 
-        const supportedUrls = ['perplexity.ai', 'chatgpt.com', 'claude.ai', 'gemini.google.com', 'grok.com', 'chat.deepseek.com'];
+        const supportedUrls = [
+            'perplexity.ai',
+            'chatgpt.com',
+            'chat.openai.com',
+            'claude.ai',
+            'gemini.google.com',
+            'grok.com',
+            'x.com/i/grok',
+            'chat.deepseek.com'
+        ];
         const isSupported = supportedUrls.some(domain => tab.url.includes(domain));
 
         if (!isSupported) {
-            if (DOM.platformStatus) DOM.platformStatus.textContent = "Unsupported";
+            currentPlatform = 'Unknown';
+            if (DOM.platformStatus) DOM.platformStatus.textContent = "No Chat Found";
+            if (DOM.platformDot) DOM.platformDot.classList.remove('active');
+            setStatus('Open a chat on ChatGPT, Claude, Perplexity, Gemini, Grok, or DeepSeek', 'warn');
             return;
         }
+        setStatus('', '');
 
         // Try to communicate with content script
         chrome.tabs.sendMessage(tab.id, { type: 'GET_PLATFORM_INFO' }, async (response) => {
@@ -246,6 +259,14 @@ async function exportCurrentChat(format = 'markdown') {
                 return;
             }
 
+            const supportedUrls = ['perplexity.ai', 'chatgpt.com', 'chat.openai.com', 'claude.ai', 'gemini.google.com', 'grok.com', 'x.com/i/grok', 'chat.deepseek.com'];
+            if (!supportedUrls.some(d => tab.url && tab.url.includes(d))) {
+                setStatus('Open a supported chat tab to export', 'warn');
+                if (typeof Toast !== 'undefined') Toast.warning('Open a supported AI chat tab to export.');
+                LoadingManager.hide('exportBtn');
+                if (loadingToastId && typeof Toast !== 'undefined') Toast.dismiss(loadingToastId);
+                return;
+            }
             chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_CONTENT' }, async (response) => {
                 try {
                     if (chrome.runtime.lastError) {
@@ -349,6 +370,13 @@ async function saveToNotion() {
                 return;
             }
 
+            const supportedUrls = ['perplexity.ai', 'chatgpt.com', 'chat.openai.com', 'claude.ai', 'gemini.google.com', 'grok.com', 'x.com/i/grok', 'chat.deepseek.com'];
+            if (!supportedUrls.some(d => tab.url && tab.url.includes(d))) {
+                setStatus('Open a supported chat tab to export', 'warn');
+                if (typeof Toast !== 'undefined') Toast.warning('Open a supported AI chat tab to export.');
+                LoadingManager.hide('saveToNotionBtn');
+                return;
+            }
             chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_CONTENT' }, async (response) => {
                 try {
                     if (chrome.runtime.lastError) {
