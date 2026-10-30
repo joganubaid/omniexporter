@@ -627,8 +627,7 @@ body {
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  margin-bottom: 16px;
-  overflow: hidden;
+  margin-bottom: 20px;
 }
 
 .card-hd {
@@ -797,15 +796,32 @@ body {
 }
 
 /* Save button */
-.settings-footer { padding: 4px 0 0; }
+.settings-footer {
+  padding: 16px 0 32px;
+}
 .btn-save {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 22px;
   background: var(--accent);
   color: #FFFFFF;
   border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 600;
   cursor: pointer;
-  transition: .15s;
+  transition: all 0.15s ease;
 }
-.btn-save:hover { background: var(--accent-hover); }
+.btn-save:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  transform: translateY(-0.5px);
+}
+.btn-save:active {
+  transform: scale(0.98);
+}
 
 /* ══════════════════════════════════════
    ABOUT TAB

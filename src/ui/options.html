@@ -204,16 +204,30 @@
               </div>
               <span id="notionTestResult" class="test-result"></span>
             </div>
-            <details class="setting-details">
-              <summary class="setting-details-summary">Advanced: OAuth2 via Cloudflare Worker</summary>
-              <div class="setting-details-body">
-                <p class="setting-hint">For Public multi-workspace integrations only. Requires OAuth enabled in Notion developer portal.</p>
-                <div class="oauth-row">
-                  <button id="connectNotionOauth" class="btn-sm btn-outline">Connect via OAuth</button>
-                  <button id="disconnectNotionOauth" class="btn-sm btn-danger" style="display:none">Disconnect</button>
-                </div>
+          </div>
+        </div>
+
+        <!-- Cloudflare OAuth Worker -->
+        <div class="card">
+          <div class="card-hd">
+            <span class="card-title">Cloudflare OAuth Worker</span>
+          </div>
+          <div class="card-bd">
+            <div class="setting-row">
+              <label class="setting-label">Deployed Worker Endpoint</label>
+              <div class="oauth-row" style="margin-bottom: 6px;">
+                <span id="cfWorkerStatus" class="status-pill">Checking...</span>
+                <code id="cfWorkerUrl" class="font-mono" style="font-size: 11px; color: var(--text-muted);">https://omniexporter-oauth.jonub250383.workers.dev</code>
               </div>
-            </details>
+              <p class="setting-hint">Serverless token-exchange proxy on Cloudflare Workers with KV rate limiting. Keeps OAuth client secret secure.</p>
+            </div>
+            <div class="setting-row">
+              <div class="oauth-row">
+                <button id="checkCfWorkerBtn" class="btn-sm btn-outline">Ping Worker</button>
+                <button id="connectNotionOauth" class="btn-sm btn-outline">Connect via OAuth</button>
+                <button id="disconnectNotionOauth" class="btn-sm btn-danger" style="display:none">Disconnect OAuth</button>
+              </div>
+            </div>
           </div>
         </div>
 

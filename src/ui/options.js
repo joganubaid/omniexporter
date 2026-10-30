@@ -749,6 +749,44 @@ async function handleOauthDisconnect() {
     log('OAuth disconnected', 'info');
 }
 
+async function checkCloudflareWorker(notify = false) {
+    const statusEl = document.getElementById('cfWorkerStatus');
+    const urlEl = document.getElementById('cfWorkerUrl');
+    const workerUrl = typeof OAUTH_SERVER_URL !== 'undefined' ? OAUTH_SERVER_URL : '';
+
+    if (urlEl && workerUrl) {
+        urlEl.textContent = workerUrl;
+    }
+
+    if (!statusEl) return;
+
+    if (!workerUrl || workerUrl.includes('YOUR_SUBDOMAIN')) {
+        statusEl.textContent = 'Not configured';
+        statusEl.className = 'status-pill';
+        if (notify) log('Cloudflare Worker URL is not configured in config.js', 'warn');
+        return;
+    }
+
+    statusEl.textContent = 'Checking...';
+    try {
+        const res = await fetch(`${workerUrl}/health`, { method: 'GET' });
+        if (res.ok) {
+            const data = await res.json().catch(() => ({}));
+            const rl = data.rate_limit ? ` (${data.rate_limit.toUpperCase()} limit)` : '';
+            statusEl.textContent = `Online${rl}`;
+            statusEl.className = 'status-pill connected';
+            if (notify) log(`Cloudflare Worker is online! Rate limit: ${data.rate_limit || 'active'}`, 'success');
+        } else {
+            statusEl.textContent = `Offline (${res.status})`;
+            statusEl.className = 'status-pill';
+            if (notify) log(`Cloudflare Worker responded with HTTP ${res.status}`, 'error');
+        }
+    } catch (e) {
+        statusEl.textContent = 'Unreachable';
+        statusEl.className = 'status-pill';
+        if (notify) log(`Could not reach Cloudflare Worker: ${e.message}`, 'error');
+    }
+}
 // ============================================================================
 // SECTION: INITIALIZATION
 // ============================================================================
@@ -770,7 +808,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadSettings();
     loadExportHistory();
     loadFailures();
-
+    checkCloudflareWorker();
     // Platform detection — must run before loadExportedUuids so the cache
     // load picks the right per-platform key.
     await updatePlatformSelector();
@@ -830,7 +868,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     document.getElementById('disconnectNotionOauth')?.addEventListener('click', handleOauthDisconnect);
-
+    document.getElementById('checkCfWorkerBtn')?.addEventListener('click', () => checkCloudflareWorker(true));
     // Load NotionOAuth module
     if (typeof NotionOAuth !== 'undefined') {
         await NotionOAuth.init();
