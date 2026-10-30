@@ -738,7 +738,12 @@ async function handleOauthConnect() {
             log('✅ OAuth2 connected. Paste your Database ID in the field above and click Save Settings.', 'success');
         }
     } catch (error) {
-        log(`OAuth connection failed: ${error.message}`, 'error');
+        const msg = error?.message || '';
+        if (msg.includes('did not approve') || msg.includes('cancelled') || msg.includes('closed') || msg.includes('Canceled')) {
+            log('OAuth window closed without approving', 'info');
+        } else {
+            log(`OAuth connection failed: ${msg}`, 'error');
+        }
     }
 }
 

@@ -21,7 +21,7 @@
 // ─── Notion OAuth ────────────────────────────────────────────────
 // Get your Client ID from: https://www.notion.so/my-integrations
 // The Client Secret goes in your Cloudflare Worker environment variables (see cloudflare-worker/DEPLOY.md)
-const NOTION_CLIENT_ID = '408d872b-594c-8163-9d1a-00377725d945';
+const NOTION_CLIENT_ID = '409d872b-594c-8136-88bf-0037d2350e1b';
 
 // ─── OAuth Server ────────────────────────────────────────────────
 // REQUIRED: Your deployed Cloudflare Worker URL (see cloudflare-worker/DEPLOY.md for deployment guide)

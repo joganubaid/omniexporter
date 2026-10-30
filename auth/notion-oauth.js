@@ -121,9 +121,15 @@ var NotionOAuth = {
                 },
                 async (redirectUrl) => {
                     if (chrome.runtime.lastError) {
-                        _logOAuth('error', 'Auth flow error', { error: chrome.runtime.lastError.message });
+                        const errMsg = chrome.runtime.lastError.message || 'Authorization flow cancelled';
+                        const isUserCancel = errMsg.includes('did not approve') || errMsg.includes('cancelled') || errMsg.includes('Canceled');
+                        if (isUserCancel) {
+                            _logOAuth('info', 'Authorization flow cancelled by user');
+                        } else {
+                            _logOAuth('error', 'Auth flow error', { error: errMsg });
+                        }
                         chrome.storage.session.remove(['notion_oauth_state', 'notion_oauth_state_created', 'notion_oauth_code_verifier']);
-                        reject(new Error(chrome.runtime.lastError.message));
+                        reject(new Error(errMsg));
                         return;
                     }
 
